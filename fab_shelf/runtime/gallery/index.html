@@ -1,0 +1,29 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src https: data: fabshelf:; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'"><title>Fab in Blender</title><link rel="stylesheet" href="gallery.css"></head>
+<body><aside><div class="brand"><b>Fab</b> in Blender</div><nav id="scope"></nav><button id="openFab">在浏览器打开 Fab ↗</button><div class="caption">资产分类</div><nav id="categories"></nav><details class="topics"><summary>常用关键词</summary><nav id="topics"></nav></details><div class="bottom"><button id="prefs">设置</button><button id="cache">封面缓存</button><button id="login">账号</button></div></aside><div id="resize" role="separator" tabindex="0" aria-label="调整侧栏宽度" aria-orientation="vertical"></div>
+<main><header><div><h1 id="title">我的库</h1></div><button id="free" class="primary">一键免费入库</button><label class="search"><span>⌕</span><input type="search" id="query" placeholder="搜索资产名称…" aria-label="搜索资产名称"></label><button id="refresh" title="刷新资产库">↻</button><button id="transfer" hidden title="下载队列"><strong></strong><span></span><progress max="100"></progress></button><div id="saveHint" hidden role="status"></div></header>
+<div id="tools"><span id="kindText">全部资产</span><div><button id="multi">多选</button><button id="prepare" hidden>批量下载</button><button id="add" hidden>添加本地文件</button><label>缩略图 <input type="range" id="zoom" min="150" max="370" step="10" value="230"></label></div></div>
+<section id="scroll"><div id="grid"></div><div id="empty"></div></section>
+<footer id="pager"><button id="prev" aria-label="上一页">‹</button><label>第 <input id="page" type="number" min="1" value="1" aria-label="跳转页码"> 页 <span id="total"></span></label><button id="next" aria-label="下一页">›</button></footer></main>
+<dialog id="inspect"><header><h2></h2><button aria-label="关闭">×</button></header><div class="inspect-body"><img alt=""><div class="specs"></div></div></dialog>
+<dialog id="batch"><header><h2>批量下载</h2><button aria-label="关闭">×</button></header><div class="batch-body"><label>规格 <select id="batchK"><option>1K</option><option selected>2K</option><option>4K</option><option>8K</option></select></label><label>文件格式 <select id="batchFmt"><option>FBX</option><option>GLB</option><option value="贴图">贴图</option></select></label><p id="batchSummary" role="status"></p><button id="batchRun" class="primary">加入下载队列</button></div></dialog>
+<dialog id="preferences"><header><h2>设置</h2><button id="prefClose" aria-label="关闭设置">×</button></header>
+<nav id="prefTabs"></nav><section data-tab="界面" hidden><label>界面语言<select id="language"><option value="zh-CN">简体中文</option><option value="en">English</option></select></label></section>
+<section data-tab="网络"><label>浏览与入库<select id="apiRoute"></select></label><label>文件下载与封面<select id="fileRoute"></select></label>
+<label>HTTP 代理<input id="proxy" placeholder="http://127.0.0.1:7890"></label><small id="detected"></small>
+<p id="effective"></p><small>更换接口线路后可能需要重新登录 Epic。活动下载会沿原线路完成。</small><div class="controls"><button id="probe">测试可用线路</button><button id="recommend" hidden>采用推荐</button></div><div id="measure"></div></section>
+<section data-tab="入库" hidden><label>默认范围<select id="prefRange"><option value="all">全部免费资产</option><option value="quixel">Quixel Megascans</option></select></label><label>默认许可<select id="prefTier"><option value="personal">个人</option><option value="professional">专业</option></select></label><label><input type="checkbox" id="background">关闭资产库窗口后继续入库</label></section>
+<section data-tab="存储" hidden><label>共享下载目录<input id="libraryDir"></label><small>目录变更在下次启动资产库会话时生效，已有文件保留在原目录。</small>
+<label>浏览封面缓存上限<select id="coverMiB"><option>128</option><option>256</option><option>512</option><option>1024</option><option>2048</option></select> MiB</label>
+<p id="usage"></p><button id="clearPreview">清理浏览封面</button></section>
+<section data-tab="诊断" hidden><pre id="diag"></pre><button id="copyDiag">复制脱敏诊断</button></section>
+<footer><span id="prefMsg" role="status"></span><button id="prefReset">本页默认值</button><button id="prefSave" class="primary">保存设置</button></footer></dialog>
+<dialog id="claim"><h2>免费资产入库</h2><p id="account"></p><label>范围 <select id="range"><option value="all">全部免费资产</option><option value="quixel">Quixel Megascans</option></select></label><label>许可 <select id="license"><option value="personal">个人</option><option value="professional">专业</option></select></label><p>仅处理所选许可下可直接领取的零元报价。限免结账、合集和需确认条款的条目留待官网处理。</p><div id="claimCounts"></div><details id="manualLinks" hidden><summary>待官网处理（最近 12 项）</summary><div></div></details><p id="claimNote" role="status"></p><div class="controls"><button id="claimRun" class="primary">开始入库</button><button id="retryFailed" hidden>仅重试异常项</button><button id="claimClose">关闭</button></div></dialog><div id="menu" popover></div><div id="toast" role="status"></div><script src="i18n.js"></script><script src="gallery.js"></script><script src="settings.js"></script></body></html>
+
+
+
+
+
+
+
+
+

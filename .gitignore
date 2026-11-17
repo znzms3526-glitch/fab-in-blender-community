@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.zip
+*.exe
+!fab_shelf/runtime/Gallery091.exe
+!fab_shelf/runtime/ShelfAuth093.exe
+!fab_shelf/runtime/MicrosoftEdgeWebview2Setup.exe
+/界面预览.png
+!/icon-preview.png
+
+
+/dist/
+
+

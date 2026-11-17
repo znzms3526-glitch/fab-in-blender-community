@@ -1,0 +1,24 @@
+name: macOS Apple Silicon smoke test
+on:
+  workflow_dispatch:
+    inputs:
+      free_usage_confirmed:
+        description: "I verified available included usage or an enforced zero-overage budget"
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  macos:
+    if: inputs.free_usage_confirmed
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and verify package
+        run: bash macos/build.sh
+      - name: Exercise gallery and IPC without user credentials
+        run: python3 macos/smoke.py dist/Fab-in-Blender-macOS-arm64.zip
