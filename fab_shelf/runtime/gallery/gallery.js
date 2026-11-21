@@ -409,7 +409,7 @@ function showClaim(r){
  if(r.identity)claimIdentity=r.identity;
  $("#account").textContent=tr("当前账号 · "+(r.account||""));
  $("#claimCounts").textContent=tr("新增 "+(c.added||0)+"　已拥有 "+(c.owned||0)+"　已核验拥有 "+(c.confirmed||0)+"　待核验 "+(c.verify||0)+"　待重试 "+(c.retry||0)+"　待官网处理 "+(c.manual||0)+"　待扫描处理 "+(c.pending||0));
- $("#claimNote").textContent=tr(r.message||(r.running?"正在后台处理，关闭面板后继续。":r.finished?"本轮扫描完成。":""));
+ $("#claimNote").textContent=tr(r.message||(r.running?"正在后台处理，关闭面板后继续。":(c.retry||c.verify)?"所有权未确认的资产可在官网核对。点击“仅重试异常项”可重新检查，已提交的条目只核验结果。":r.finished?"本轮扫描完成。":""));
  const details=$("#manualLinks"), links=details.querySelector("div");
  details.hidden=!r.manual?.length;links.replaceChildren();
  for(const asset of r.manual||[])links.append(button(asset.title+" ↗",()=>rpc("viewListing",{uid:asset.uid})));

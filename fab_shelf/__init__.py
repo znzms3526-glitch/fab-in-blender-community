@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Fab in Blender · Fab 资产库",
     "author": "Fab Shelf",
-    "version": (0, 10, 3),
+    "version": (0, 10, 5),
     "blender": (4, 1, 1),
     "location": "3D 视图 > N 面板 > Fab",
     "description": "从副屏浏览个人 Fab 库，将所选资产文件收集到当前工程",

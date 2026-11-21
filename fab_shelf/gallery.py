@@ -134,7 +134,7 @@ class Gallery:
                     apiLabel=network.LABELS[s["apiRoute"]]+(" · "+s["proxy"] if s["apiRoute"]=="proxy" else ""),
                     fileLabel=network.label(s["fileRoute"],s["proxy"]),
                     connection=self.connection,taskState="运行中" if self.claims.running else "空闲",nextCache=self.next_cache,defaultCache=str(Path.home()/"FabShelfCache"),
-                    cache=str(self.cache),lastError=self.last_error,lastTest=self.last_test,version="0.10.3")
+                    cache=str(self.cache),lastError=self.last_error,lastTest=self.last_test,version="0.10.5")
 
     def speed_test(self,proxy):
         proxy=network.proxy_address(proxy)

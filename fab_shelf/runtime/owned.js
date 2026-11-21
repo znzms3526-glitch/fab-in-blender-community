@@ -61,44 +61,80 @@ async function fabRequest(q) {
     const r=await get("/i/listings/search?"+p);
     return {items:r.results.map(x=>({uid:x.uid,title:x.title})),next:r.cursors?.next||""};
   }
-  if(q.op==="ownedBatch"){
-    const me=await account();
-    if(me.uid!==q.account)throw Error("账号已变更，任务已暂停");
+  async function batchStates(uids){
     const params=new URLSearchParams();
-    for(const uid of q.uids)params.append("listing_ids",uid);
-    const states=await get("/i/users/me/listings-states?"+params);
-    if(!Array.isArray(states))throw Error("Fab 批量所有权响应格式异常");
-    const owned=q.uids.filter(uid=>{
-      const matches=states.filter(row=>row.uid===uid);
-      return matches.length===1 && matches[0].acquired===true;
+    for(const uid of uids)params.append("listing_ids",uid);
+    const rows=await get("/i/users/me/listings-states?"+params);
+    if(!Array.isArray(rows))return [];
+    return uids.flatMap(uid=>{
+      const matches=rows.filter(row=>row?.uid===uid);
+      if(matches.length!==1 || typeof matches[0].acquired!=="boolean")return [];
+      return [{uid,acquired:matches[0].acquired}];
     });
-    return {owned};
   }
-  if(q.op==="claimFree"){
-    const me=await account();
-    if(me.uid!==q.account)throw Error("账号已变更，任务已暂停");
-    const owns=async()=>{
+  function unavailableRead(e){
+    return /响应格式异常|HTTP (400|404)\b/.test(e.message);
+  }
+  async function ownership(){
+    try{
       const state=await get("/i/users/me/listings-states/"+id+"?fields=ownership");
-      if(!Array.isArray(state.ownership))throw Error("无法核对所有权");
-      return state.ownership.length>0;
-    };
-    if(await owns())return {status:"owned"};
-    const [d,p]=await Promise.all([get(base),get(base+"/prices-infos")]);
-    if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle" || !me.accepted)return {status:"manual"};
-    const licenses=Array.isArray(d.licenses)?d.licenses:[];
-    const l=licenses.find(l=>l.slug===q.tier)||licenses.find(l=>l.isCc0||l.isCc);
-    const offer=p.offers?.find(o=>o.offerId===l?.offerId);
-    if(!offer||!l?.offerId)return {status:"manual"};
-    if(typeof offer.price!=="number" || offer.price!==0)return {status:"manual"};
-    if(offer.discountedPrice!=null && offer.discountedPrice!==0)return {status:"manual"};
-    const token=()=>document.cookie.split(";").map(c=>c.trim()).find(c=>c.startsWith("fab_csrftoken="))?.slice(14);
-    if(!token())await fetch("/i/csrf",{credentials:"same-origin"});
-    if(!token())throw Error("Fab 登录验证已过期");
-    const result=await fetch(base+"/add-to-library",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CsrfToken":decodeURIComponent(token()),"X-Requested-With":"XMLHttpRequest"},body:new URLSearchParams({offer_id:l.offerId})});
-    if([401,403,429].includes(result.status)||result.status>=500)throw httpError(result);
-    if(await owns())return {status:"added"};
-    if(result.ok)throw Error("Fab 已接收请求，所有权尚未确认，请稍后继续核验");
-    return {status:"manual"};
+      if(Array.isArray(state?.ownership) && (state.uid==null || state.uid===q.uid))
+        return state.ownership.length>0;
+    }catch(e){if(!unavailableRead(e))throw e;}
+    try{
+      const rows=await batchStates([q.uid]);
+      return rows[0]?.acquired ?? null;
+    }catch(e){if(!unavailableRead(e))throw e;return null;}
+  }
+  if(q.op==="ownedBatch" || q.op==="checkFree" || q.op==="submitFree"){
+    let me,current;
+    try{
+      // Treat a negative batch row as a hint. Read it again, then check the account
+      // before using that result or requesting an offer for the selected license.
+      if(q.op==="submitFree" && q.recheckOwnership){
+        try{current=await ownership();}
+        catch(e){
+          if(/Failed to fetch|NetworkError|HTTP (5\d\d|408)\b/.test(e.message))
+            return {status:"readSeparately"};
+          throw e;
+        }
+      }
+      me=await account();
+      if(me.uid!==q.account)throw Error("账号已变更，任务已暂停");
+    }catch(e){
+      if(q.op==="submitFree")return {status:"beforeSubmitError",message:e.message};
+      throw e;
+    }
+    if(q.op==="ownedBatch"){
+      const rows=await batchStates(q.uids);
+      return {owned:rows.filter(row=>row.acquired).map(row=>row.uid),
+              available:rows.filter(row=>!row.acquired).map(row=>row.uid)};
+    }
+    if(q.op==="checkFree"){
+      const value=await ownership();
+      return {status:value===null?"unknown":value?"owned":"available"};
+    }
+    let offerId,csrf;
+    try{
+      if(q.recheckOwnership && current!==false)return {status:current===true?"owned":"retry"};
+      const [d,p]=await Promise.all([get(base),get(base+"/prices-infos")]);
+      if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle" || !me.accepted)return {status:"manual"};
+      const licenses=Array.isArray(d.licenses)?d.licenses:[];
+      const l=licenses.find(l=>l.slug===q.tier)||licenses.find(l=>l.isCc0||l.isCc);
+      const offer=p.offers?.find(o=>o.offerId===l?.offerId);
+      if(!offer||!l?.offerId)return {status:"manual"};
+      if(typeof offer.price!=="number" || offer.price!==0)return {status:"manual"};
+      if(offer.discountedPrice!=null && offer.discountedPrice!==0)return {status:"manual"};
+      const token=()=>document.cookie.split(";").map(c=>c.trim()).find(c=>c.startsWith("fab_csrftoken="))?.slice(14);
+      if(!token())await fetch("/i/csrf",{credentials:"same-origin"});
+      if(!token())throw Error("Fab 登录验证已过期");
+      offerId=l.offerId;
+      csrf=decodeURIComponent(token());
+    }catch(e){return {status:"beforeSubmitError",message:e.message};}
+    const result=await fetch(base+"/add-to-library",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/x-www-form-urlencoded","X-CsrfToken":csrf,"X-Requested-With":"XMLHttpRequest"},body:new URLSearchParams({offer_id:offerId})});
+    if([401,403,429].includes(result.status))throw httpError(result);
+    if(await ownership()===true)return {status:result.ok?"added":"confirmed"};
+    return {status:"verify"};
   }
   if(q.op==="taxonomy"){
     const [tree,types]=await Promise.all([get("/i/taxonomy/categories/tree"),get("/i/taxonomy/listing-types")]);

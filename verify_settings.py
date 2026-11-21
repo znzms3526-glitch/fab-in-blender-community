@@ -48,11 +48,13 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
         else:raise AssertionError("credentials accepted")
         def unstable(q):
             if q["op"]=="freePage":return {"items":[{"uid":"x","title":"fixture"}],"next":""}
-            raise ValueError("Fab 已接收请求，所有权尚未确认，请稍后继续核验")
+            if q["op"]=="checkFree":return {"status":"available"}
+            assert q["op"]=="submitFree"
+            return {"status":"verify"}
         with patch.object(app,"api",unstable):
             app.claims.start(user,"all","personal");wait()
         assert app.claims.status()["counts"]=={"verify":1}
-        with patch.object(app,"api",lambda q:{"status":"owned"} if q["op"]=="claimFree" else (_ for _ in ()).throw(AssertionError("rescanned"))):
+        with patch.object(app,"api",lambda q:{"status":"owned"} if q["op"]=="checkFree" else (_ for _ in ()).throw(AssertionError("rescanned or resubmitted"))):
             app.claims.start(user,"all","personal",True);wait()
         assert app.claims.status()["counts"]=={"confirmed":1}
     finally:app.close();app.join()
