@@ -78,11 +78,24 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td, ThreadPoolExe
     task=FreeTask(stub)
     def reconcile(q):
         if q["op"]=="ownedBatch":return {"owned":[]}
+        if q["op"]=="submitFree":
+            assert q["uid"]=="0" and q["recheckOwnership"]
+            return {"status":"readSeparately"}
         assert q["op"]=="checkFree",q
         return {"status":{"0":"available","1":"owned","2":"owned"}[q["uid"]]}
     stub.api=reconcile
     task.start(me,"quixel","personal",True);wait()
     assert task.status()["counts"]=={"owned":21,"added":1,"confirmed":1,"verify":1}
+
+    def retry_confirmed_absence(q):
+        assert q["uid"]=="0"
+        if q["op"]=="checkFree":return {"status":"available"}
+        assert q["op"]=="submitFree" and q["recheckOwnership"]
+        return {"status":"added"}
+
+    stub.api=retry_confirmed_absence
+    task.start(me,"quixel","personal",True);wait()
+    assert task.status()["counts"]=={"owned":21,"added":2,"confirmed":1}
     pages=[]
     def outage(q):
         if q["op"]=="freePage":
@@ -117,7 +130,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td, ThreadPoolExe
         assert q["op"]=="submitFree" and uid!="legacy"
         if uid=="limited" and limited:
             limited=False
-            return {"status":"beforeSubmitError","message":"Fab HTTP 429 retry=3"}
+            return {"status":"rejected","message":"Fab HTTP 429 retry=3"}
         if uid=="separate" and q["recheckOwnership"]:return {"status":"readSeparately"}
         assert q["recheckOwnership"]==(uid not in {"slow","separate"})
         submitted.append(uid)

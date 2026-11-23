@@ -150,7 +150,15 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigatio
                 return
             }
             if let err=routeError{finish(["error":err]);return}
-            guard ready,web.url?.host=="www.fab.com" else{finish(["error":"请先登录 Fab"]);return}
+            guard ready,web.url?.host=="www.fab.com" else{
+                if ready,q["op"] as? String == "account",q["allowSignedOut"] as? Bool == true {
+                    finish(["uid":""])
+                    if !window.isVisible {web.load(URLRequest(url:URL(string:"https://www.fab.com/")!))}
+                }else{
+                    finish(["error":"请先登录 Fab"])
+                }
+                return
+            }
             busy=true
             web.callAsyncJavaScript(script+";return await fabRequest(q)",arguments:["q":q],in:nil,in:.defaultClient){ result in
                 switch result{

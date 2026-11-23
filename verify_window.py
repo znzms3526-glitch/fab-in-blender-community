@@ -1,4 +1,5 @@
 """Windows GUI integration check with the signed-in Fab account and the legacy cardboard fixture."""
+import hashlib
 import os
 import sys
 import shutil
@@ -6,6 +7,7 @@ import tempfile
 import subprocess
 import json
 import time
+import zipfile
 from pathlib import Path
 import bpy
 import addon_utils
@@ -30,6 +32,28 @@ with tempfile.TemporaryDirectory() as temp:
             info_low=info.copy()
             shutil.copy(record,cache/"records"/record.name)
             shutil.copy(original/"packages"/info["hash"],cache/"packages"/info["hash"])
+    account_test="--account-test" in sys.argv
+    if account_test and not list((cache/"records").glob("*.json")):
+        bpy.ops.object.select_all(action="DESELECT")
+        bpy.ops.mesh.primitive_cube_add(size=1)
+        fixture=bpy.context.object
+        model=temp/"qa_1K.fbx"
+        assert "FINISHED" in bpy.ops.export_scene.fbx(filepath=str(model),use_selection=True)
+        texture=temp/"qa_BaseColor.png"
+        image=bpy.data.images.new("Test 1K",1024,1024)
+        image.filepath_raw=str(texture)
+        image.file_format="PNG"
+        image.save()
+        package=temp/"qa_1K.zip"
+        with zipfile.ZipFile(package,"w") as archive:
+            archive.write(model,model.name)
+            archive.write(texture,texture.name)
+        digest=hashlib.sha256(package.read_bytes()).hexdigest()
+        shutil.copyfile(package,cache/"packages"/digest)
+        info_low=dict(hash=digest,uid="789fefcc-a7e3-4886-9072-35b7dbe7cc83",name=package.name,
+                      title="QA model",format="fbx",kind="3d-model")
+        (cache/"records"/(digest+".json")).write_text(json.dumps(info_low),encoding="utf8")
+        bpy.data.objects.remove(fixture,do_unlink=True)
     assert list((cache/"records").glob("*.json")), "missing cardboard fixture"
     bpy.ops.wm.save_as_mainfile(filepath=str(temp/"test.blend"))
     runtime=folder/"fab_shelf"/"runtime"
@@ -40,7 +64,6 @@ with tempfile.TemporaryDirectory() as temp:
     bpy.context.view_layer.active_layer_collection=bpy.context.view_layer.layer_collection.children[target.name]
     bpy.context.scene.cursor.location=(3,5,7)
 
-    account_test="--account-test" in sys.argv
     proc=subprocess.Popen([str(out/"GalleryTest.exe"),box.name,str(os.getpid()),str(cache),"测试工程"]+(["account"] if account_test else []))
     ctl=gallery.Gallery(cache,ipc,manage_auth=not account_test)
     if account_test:
@@ -52,7 +75,10 @@ with tempfile.TemporaryDirectory() as temp:
             if op=="library":return {"items":[info_low],"next":None}
             if op=="account":return {"name":"QA","uid":"test-account"}
             if op=="presence":return {"found":[]}
-            if op=="formats":return {"files":[dict(name="fixture_4k.glb",uid="qa-format",format="glb",bytes=1024)]}
+            if op=="formats":return {"account":"test-account","files":[
+                dict(name="fixture_4k.glb",uid="qa-format",format="glb",bytes=1024),
+                dict(name="fixture.glb",uid="qa-original",format="glb",bytes=512),
+            ]}
             if op=="taxonomy":return {"tree":{},"types":{}}
             raise ValueError(op)
         ctl.api=fixture_api

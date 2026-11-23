@@ -12,8 +12,8 @@ def role(path):
     key = path.stem.lower()
     for channel, pattern in (
         ("ORM", r"(?:^|[_ -])(orm|arm|occlusionroughnessmetallic)(?:$|[_ -])"),
-        ("Base Color", "base.?colou?r|albedo|diffuse"),
-        ("Normal", "normal"), ("Roughness", "roughness"), ("Metallic", "metalness|metallic"),
+        ("Base Color", r"base.?colou?r|albedo|diffuse|_bc$"),
+        ("Normal", r"normal|_n$"), ("Roughness", r"roughness|_r$"), ("Metallic", r"metalness|metallic|_m$"),
         ("Alpha", "opacity|alpha|cutout"), ("Height", "displacement|height|bump"),
     ):
         if re.search(pattern, key):

@@ -2,9 +2,9 @@
 
 Community edition · Windows x64 · [GPL-3.0-or-later](LICENSE) · [许可适用范围与第三方组件](COPYING.md)
 
-在 Blender 里打开自己的 Fab 资产库，把模型、材质和贴花导入当前工程。资产库可以移到副屏，主屏继续看场景。在线浏览和下载需要 Epic 账号；Windows 版无需安装 Epic Games Launcher 或 Quixel Bridge。
+在 Blender 的副屏窗口浏览 Fab、手动领取免费资产，或粘贴商品链接直达。下载的模型和材质可以导入工程，也可以加入 Blender 原生资产库供其他工程拖用。领取和插件内下载需要 Epic 账号。Windows 版无需安装 Epic Games Launcher 或 Quixel Bridge。
 
-Browse your Fab library from Blender, download the files you need, and import assets at the 3D cursor. The library opens in a separate window for dual-monitor setups. This is a community-developed add-on for Windows x64.
+Browse Fab from a separate Blender companion window, claim free assets on Fab, or paste a product link. Downloaded files can be imported at the 3D cursor or added to Blender's Asset Browser for reuse across projects. This is a community-developed add-on for Windows x64.
 
 **[下载 Windows 插件 / Download for Windows](https://github.com/znzms3526-glitch/fab-in-blender-community/releases/latest)** · [使用说明](使用说明.md) · [报告问题 / Report an issue](https://github.com/znzms3526-glitch/fab-in-blender-community/issues)
 
@@ -22,6 +22,8 @@ Browse your Fab library from Blender, download the files you need, and import as
 | 你想做什么 | 操作 |
 |---|---|
 | 找素材，暂时不占下载空间 | 搜索或展开分类，点星标存到本地收藏。鼠标移到卡片上按空格可看大图和文件规格。 |
+| 逛 Fab 或打开别人发来的商品链接 | 在「探索 Fab」用官网筛选和查看详情，也可以点「粘贴 Fab 链接」。免费商品在官网页面手动领取，完成后点「下载到插件」。 |
+| 在下一个工程复用已下载素材 | 在素材详情点「加入 Blender 资产库」。在 Blender 资产浏览器选择 Fab 库即可拖用。 |
 | 一次准备多件资产 | 点「多选」后统一选规格。提交前可以看到几件已缓存、几件需要下载、几件没有所选规格。 |
 | 把同一个道具摆在多个位置 | 再点「导入」。支持复用的静态单网格模型共享网格和材质，每个物体都能单独移动。齿轮菜单可以创建独立副本。 |
 | 渲染前提高贴图分辨率 | 选中物体，在 **N → Fab → Fab 来源** 切换贴图规格。默认只更新当前物体，也可选择共用材质的物体一起更新。 |

@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from zipfile import BadZipFile
 from pathlib import Path
 
 import bpy
@@ -114,12 +115,10 @@ def upgrade(obj, paths, req):
                 candidates = [(p,n) for p,n in zip(paths,req["files"]) if scene.role(p) == scene.role(Path(member))]
                 if sum(scene.role(Path(x.image.get("fab_member",""))) == scene.role(Path(member)) for x in texture_nodes(mat)) != 1:
                     continue
-            exact = [(p,n) for p,n in candidates if catalog.size(n) == source["k"]]
-            candidates = exact or [(p,n) for p,n in candidates if not catalog.size(n)]
             if len(candidates) == 1:
                 p,n = candidates[0]
                 img = bpy.data.images.load(str(p), check_existing=True)
-                if img == old:
+                if img == old or max(img.size)!=int(source["k"])*1024:
                     continue
                 if img.users and img.colorspace_settings.name != old.colorspace_settings.name:
                     img = img.copy()
@@ -149,11 +148,11 @@ def upgrade(obj, paths, req):
 
 
 def missing_images(cache):
+    checks = {}
     for img in bpy.data.images:
         if img.library or img.source != "FILE" or img.packed_file or not img.filepath:
             continue
-        if Path(bpy.path.abspath(img.filepath)).is_file():
-            continue
+        current = Path(bpy.path.abspath(img.filepath))
         src,member = reference(img),img.get("fab_member")
         if not src or not member:
             match = re.search(r"(?:^|/)Assets/Fab/([0-9a-f]{64})/(.+)$", img.filepath.replace("\\","/"))
@@ -166,6 +165,18 @@ def missing_images(cache):
             except (OSError, ValueError):
                 src = {"hash":digest,"name":Path(member).name}
         if not re.fullmatch(r"[0-9a-f]{64}",str(src.get("hash",""))):continue
+        if current.is_file():
+            try:
+                if not bpy.data.filepath or current.resolve()!=project_file(src,member):
+                    continue
+                key = (src["hash"],src.get("name"))
+                if key not in checks:
+                    checks[key] = storage.member_checks(cache,src)
+                expected = checks[key].get(member)
+                if expected is None or storage.file_matches(current,*expected):
+                    continue
+            except (OSError, ValueError, KeyError, BadZipFile):
+                continue
         yield img,src,member
 
 
@@ -187,12 +198,13 @@ def relink(cache, selected):
             continue
         try:
             path=project_file(src,member)
-            if not path.is_file():
-                if not (cache/"packages"/src["hash"]).is_file():continue
+            if (cache/"packages"/src["hash"]).is_file():
                 path, = storage.stage(cache,project,dict(hash=src["hash"],name=src["name"],files=[member],mode=1))
+            elif not path.is_file():
+                continue
             img.filepath = bpy.path.relpath(str(path)).replace("\\","/")
             img.reload()
             count += 1
-        except (ValueError, OSError, KeyError) as e:
+        except (ValueError, OSError, KeyError, BadZipFile) as e:
             failures.append(f"{img.name} · {e}")
     return count, failures

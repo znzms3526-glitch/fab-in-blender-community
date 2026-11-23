@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Fab in Blender · Fab 资产库",
     "author": "Fab Shelf",
-    "version": (0, 10, 5),
+    "version": (0, 11, 6),
     "blender": (4, 1, 1),
     "location": "3D 视图 > N 面板 > Fab",
-    "description": "从副屏浏览个人 Fab 库，将所选资产文件收集到当前工程",
+    "description": "在副屏浏览 Fab，下载资产并导入工程或 Blender 资产库",
     "category": "Import-Export",
 }
 
@@ -21,7 +21,7 @@ import threading
 import bpy
 from bpy.app.handlers import persistent
 
-from . import scene, storage, gallery, project_assets, webview_runtime
+from . import scene, storage, gallery, project_assets, webview_runtime, asset_library
 
 _session = {}
 _task = None
@@ -282,6 +282,7 @@ def tick():
         box=_session.get("box")
         if box:
             controller=_session["gallery"]
+            controller.register_asset_libraries(asset_library.register)
             changed=getattr(controller,"cache_update",None)
             if changed:
                 prefs(bpy.context).cache=changed
@@ -408,7 +409,7 @@ class FAB_RepairPackage(bpy.types.PropertyGroup):
 
 class FAB_OT_repair(bpy.types.Operator):
     bl_idname="fabshelf.repair_textures"
-    bl_label="检查并修复缺失贴图"
+    bl_label="检查并修复 Fab 贴图"
     packages:bpy.props.CollectionProperty(type=FAB_RepairPackage)
 
     def invoke(self,context,event):
@@ -428,7 +429,7 @@ class FAB_OT_repair(bpy.types.Operator):
             row.label=img.name+" · "+(route if row.online else "本地可修复")
             row.name=img.name
         if not self.packages:
-            self.report({"INFO"},"工程中的 Fab 贴图路径均有效")
+            self.report({"INFO"},"未发现缺失或损坏的 Fab 贴图")
             return {"FINISHED"}
         return context.window_manager.invoke_props_dialog(self,width=540)
 

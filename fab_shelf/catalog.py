@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import re
@@ -6,10 +7,10 @@ import shutil
 import struct
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.request import urlopen, Request
 
-from .storage import MODELS, IMAGES
+from .storage import MODELS, IMAGES, archive_members
 
 
 def size(name):
@@ -39,23 +40,134 @@ def pick_format(files, tier, kind):
     return min(supported, key=rank)
 
 
-def default_files(names, tier, role, chosen=None):
+def image_dimensions(stream):
+    header = stream.read(24)
+    if header.startswith(b"\x89PNG\r\n\x1a\n") and header[12:16] == b"IHDR" and len(header) == 24:
+        return struct.unpack(">II", header[16:24])
+    if header[:2] != b"\xff\xd8":
+        return None
+    data = header + stream.read(65536)
+    pos = 2
+    while pos + 4 <= len(data) and data[pos] == 255:
+        marker = data[pos + 1]
+        if marker == 255:
+            pos += 1
+            continue
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if length < 2 or marker in (0xda, 0xd9):
+            break
+        if marker in (0xc0, 0xc1, 0xc2, 0xc3) and pos + 9 <= len(data):
+            height, width = struct.unpack_from(">HH", data, pos + 5)
+            return width, height
+        pos += 2 + length
+    return None
+
+
+def glb_dimensions(stream, name):
+    header = stream.read(20)
+    if len(header) != 20 or header[:4] != b"glTF":
+        return {}
+    version, total, length, kind = struct.unpack_from("<IIII", header, 4)
+    if version != 2 or kind != 0x4e4f534a or length > min(16_000_000, total-28):
+        return {}
+    doc = json.loads(stream.read(length))
+    chunk = stream.read(8)
+    if len(chunk) != 8 or chunk[4:] != b"BIN\x00":
+        return {}
+    start = stream.tell()
+    limit = min(int.from_bytes(chunk[:4], "little"), total-start)
+    sizes = {}
+    views = doc.get("bufferViews", [])
+    for index, image in enumerate(doc.get("images", [])):
+        key = f"{name}#image-{index}"
+        sizes[key] = None
+        ref = image.get("bufferView")
+        if type(ref) != int or not 0 <= ref < len(views):
+            continue
+        view = views[ref]
+        offset, size = view.get("byteOffset", 0), view["byteLength"]
+        if view["buffer"] != 0 or offset < 0 or size < 24 or offset+size > limit:
+            continue
+        stream.seek(start+offset)
+        dims = image_dimensions(io.BytesIO(stream.read(min(size, 65560))))
+        if dims and min(dims) > 0:
+            sizes[key] = dims
+    return sizes
+
+
+def texture_dimensions(blob, name):
+    sizes = {}
+    try:
+        if zipfile.is_zipfile(blob):
+            with zipfile.ZipFile(blob) as archive, archive_members(archive) as members:
+                for member, (container, item) in members.items():
+                    if Path(member).suffix.lower() == ".glb":
+                        with container.open(item) as stream:
+                            sizes.update(glb_dimensions(stream, member))
+                    elif Path(member).suffix.lower() in IMAGES:
+                        with container.open(item) as stream:
+                            size_px = image_dimensions(stream)
+                        if size_px and min(size_px) > 0:
+                            sizes[member] = size_px
+        elif Path(name).suffix.lower() == ".glb":
+            with blob.open("rb") as stream:
+                sizes.update(glb_dimensions(stream, name))
+        elif Path(name).suffix.lower() in IMAGES:
+            with blob.open("rb") as stream:
+                size_px = image_dimensions(stream)
+            if size_px and min(size_px) > 0:
+                sizes[name] = size_px
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError, zipfile.BadZipFile, EOFError):
+        pass
+    return sizes
+
+
+def default_files(names, tier, role, chosen=None, dimensions=None):
     goal = {"LIGHT":1,"STANDARD":2,"HIGH":4}.get(tier, tier)
     models = sorted(n for n in names if Path(n).suffix.lower() in MODELS)
-    model = chosen if chosen in models else min(models,default=None,key=lambda n:abs(quality(n)-goal))
+    model = chosen if chosen in models else next(iter(models), None)
     selected = [model] if model else []
-    def similarity(n):
-        model_tokens=set(re.findall(r"[a-z0-9]+", (model or "").lower()))
-        return len(model_tokens.intersection(re.findall(r"[a-z0-9]+", n.lower())))
+    def stem_tokens(path):
+        return {token for token in re.findall(r"[a-z0-9]+", path.stem.lower())
+                if not re.fullmatch(r"\d+k|lod\d+|low|mid|medium|high|raw", token)}
+
+    def member_path(name):
+        return PurePosixPath(name.replace("\\", "/").lower())
+
+    model_paths = [member_path(name) for name in models]
+    families = {path: stem_tokens(path) for path in model_paths}
+    selected_model = member_path(model) if model else None
+
+    def affinity(path, image, tokens):
+        folder = path.parent
+        return len(families[path] & tokens), len(folder.parts) if folder in image.parents else 0
+
+    def matches_model(name):
+        if len(model_paths) < 2:
+            return True
+        image = member_path(name)
+        tokens = stem_tokens(image)
+        best = affinity(selected_model, image, tokens)
+        if not any(best):
+            return len({(path.parent, frozenset(families[path])) for path in model_paths}) == 1
+        selected_family = (selected_model.parent, families[selected_model])
+        return all((path.parent, families[path]) == selected_family or affinity(path,image,tokens) < best
+                   for path in model_paths)
+
     groups = {}
     for n in names:
-        if Path(n).suffix.lower() not in IMAGES:
+        if Path(n).suffix.lower() not in IMAGES or not matches_model(n):
             continue
         key = role(Path(n))
         if key and key!="Height":
             groups.setdefault(key,[]).append(n)
+    def rank(n):
+        pixels = (dimensions or {}).get(n)
+        level = max(pixels) / 1024 if pixels else size(n)
+        overlap = len(families[selected_model] & stem_tokens(member_path(n))) if selected_model else 0
+        return (abs(level-goal) if level else float("inf"), -overlap, n)
     for group in groups.values():
-        selected.append(min(group,key=lambda n:(-similarity(n),abs(size(n)-goal) if size(n) else 9,n)))
+        selected.append(min(group, key=rank))
     if not selected and len(names)==1:
         selected=list(names)
     return selected
@@ -68,8 +180,8 @@ def local_files(cache, rec):
 
 def package_members(blob,name):
     if zipfile.is_zipfile(blob):
-        with zipfile.ZipFile(blob) as z:
-            return [n for n in z.namelist() if Path(n).suffix.lower() in MODELS | IMAGES]
+        with zipfile.ZipFile(blob) as z, archive_members(z) as members:
+            return list(members)
     return [name] if Path(name).suffix.lower() in MODELS | IMAGES else []
 
 
@@ -78,6 +190,19 @@ def atomic_json(path, obj):
     with tempfile.NamedTemporaryFile("w",dir=path.parent,delete=False,encoding="utf8") as out:
         json.dump(obj,out,ensure_ascii=False)
     os.replace(out.name,path)
+
+
+def save_package_record(cache, record):
+    """Preserve the content lookup used by older projects and each Fab listing association."""
+    records = cache / "records"
+    digest = record["hash"]
+    uid = record.get("uid")
+    if uid:
+        suffix = hashlib.sha256(uid.encode()).hexdigest()
+        atomic_json(records / f"{digest}-{suffix}.json", record)
+    canonical = records / f"{digest}.json"
+    if not canonical.exists():
+        atomic_json(canonical, record)
 
 
 def transfer(cache, url, listing, item, progress=None):
@@ -103,7 +228,7 @@ def transfer(cache, url, listing, item, progress=None):
             os.replace(path,dest)
         rec=dict(hash=key,name=item["name"],uid=listing["uid"],title=listing["title"],kind=listing["kind"],
                  thumb=listing.get("thumb",""),file=item["uid"],source="https://www.fab.com/listings/"+listing["uid"])
-        atomic_json(cache/"records"/(key+".json"),rec)
+        save_package_record(cache, rec)
         return rec
     finally:
         path.unlink(missing_ok=True)

@@ -21,6 +21,8 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td:
     ctl=gallery.Gallery(root,box,"saved-project")
     ctl.assets["fixture"]=dict(uid="fixture",title="Pinned fixture",kind="3d-model",category="food-drink--fruit")
     ctl.favorite("fixture",True)
+    ctl.local_ready.result()
+    ctl.api=lambda q:{"uid":"fixture-account"}
     ctl.formats["fixture"]=[dict(uid="fileA",name="model_2k.glb",k=2,fmt="GLB",format="glb",bytes=1234)]
     with ctl.lock:
         ctl.enqueue(dict(uid="fixture",k=2,fmt="GLB"))

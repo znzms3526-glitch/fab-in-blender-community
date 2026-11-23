@@ -3,6 +3,7 @@ using System.IO;
 using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Forms;
+using System.Collections.Generic;
 using Microsoft.Web.WebView2.WinForms;
 using Microsoft.Web.WebView2.Core;
 using System.Web.Script.Serialization;
@@ -13,12 +14,19 @@ class Gallery : Form {
     readonly JavaScriptSerializer json=new JavaScriptSerializer();
     readonly string box;
     readonly Process parent;
+    readonly FabBrowser browse;
     bool ready;
+    static string Field(Dictionary<string,object> fields,string key) {
+        object value;
+        return fields.TryGetValue(key,out value)?value as string:null;
+    }
     Gallery(string[] a){
         box=a[0];parent=Process.GetProcessById(int.Parse(a[1]));
         Icon=Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         Text="Fab in Blender  ·  "+a[3];Size=new Size(1320,850);MinimumSize=new Size(720,440);
         view.Dock=DockStyle.Fill;Controls.Add(view);
+        browse=new FabBrowser(this, message=>view.CoreWebView2.PostWebMessageAsJson(json.Serialize(message)));
+        FormClosed+=(s,e)=>browse.Dispose();
         Shown+=async(s,e)=>{
             try{
                 var profile=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"FabShelf","GalleryProfile");
@@ -31,11 +39,42 @@ class Gallery : Form {
                 core.SetVirtualHostNameToFolderMapping("covers.invalid",Path.Combine(a[2],"previews"),CoreWebView2HostResourceAccessKind.Allow);
                 core.NavigationStarting+=(o,n)=>{if(n.Uri!="https://library.invalid/index.html")n.Cancel=true;};
                 core.NewWindowRequested+=(o,n)=>{n.Handled=true;};
-                core.WebMessageReceived+=(o,m)=>{
+                core.WebMessageReceived+=async(o,m)=>{
                     if(m.Source!="https://library.invalid/index.html")return;
                     string text=m.WebMessageAsJson;
                     if(text.Length>100000)return;
-                    var msg=json.Deserialize<System.Collections.Generic.Dictionary<string,object>>(text);
+                    var msg=json.Deserialize<Dictionary<string,object>>(text);
+                    var op=Field(msg,"op");
+                    if(op!=null && op.StartsWith("fabBrowser",StringComparison.Ordinal)){
+                        var id=Field(msg,"id");
+                        try{
+                            object result="";
+                            switch(op){
+                                case "fabBrowserLayout":
+                                    browse.SetBounds((bool)msg["visible"],Convert.ToDouble(msg["x"]),Convert.ToDouble(msg["y"]),
+                                        Convert.ToDouble(msg["width"]),Convert.ToDouble(msg["height"]));
+                                    break;
+                                case "fabBrowserOpen":
+                                    await browse.Open(Field(msg,"mode"),Field(msg,"proxy"),Field(msg,"url"),Field(msg,"lookup"));
+                                    break;
+                                case "fabBrowserParse":
+                                    string uid;
+                                    var link=FabBrowser.ParseLink(Field(msg,"url"),out uid);
+                                    result=new{uid=uid,url=link.AbsoluteUri};break;
+                                case "fabBrowserBack":
+                                    browse.Back();break;
+                                case "fabBrowserRefresh":
+                                    browse.Refresh();break;
+                                case "fabBrowserExternal":
+                                    browse.OpenExternal();break;
+                                default:throw new ArgumentException("未知浏览操作");
+                            }
+                            if(id!=null && !IsDisposed)core.PostWebMessageAsJson(json.Serialize(new{id=id,result=result}));
+                        }catch(Exception ex){
+                            if(id!=null && !IsDisposed)core.PostWebMessageAsJson(json.Serialize(new{id=id,error=ex.Message}));
+                        }
+                        return;
+                    }
                     if(msg.ContainsKey("op") && (string)msg["op"]=="openFab"){
                         Process.Start(new ProcessStartInfo("https://www.fab.com/"){UseShellExecute=true});
                         core.PostWebMessageAsJson(json.Serialize(new{id=msg["id"],result=""}));return;

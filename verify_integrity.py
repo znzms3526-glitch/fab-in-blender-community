@@ -51,7 +51,10 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td:
         paths[1].write_bytes(b"")
         storage.stage(cache,project,request)
         if paths[1].read_bytes()!=texture.read_bytes():issues.append("empty project copy reused")
-        paths[1].write_bytes(texture.read_bytes())
+        same_length_damage = bytes([0xAB]) * texture.stat().st_size
+        paths[1].write_bytes(same_length_damage)
+        storage.stage(cache,project,request)
+        assert paths[1].read_bytes() == texture.read_bytes()
         meshes=[o for o in scene.import_files(bpy.context,paths,0,"Chair") if o.type=="MESH"]
         if len({o.material_slots[0].material for o in meshes})!=2:issues.append("distinct source materials merged")
     finally:ctl.close();ctl.join()

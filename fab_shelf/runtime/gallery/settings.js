@@ -47,7 +47,15 @@ $("#copyDiag").onclick=async()=>{try{await navigator.clipboard.writeText($("#dia
 $("#prefSave").onclick=async()=>{
  const values={language:$("#language").value,apiRoute:$("#apiRoute").value,fileRoute:$("#fileRoute").value,proxy:$("#proxy").value.trim(),range:$("#prefRange").value,tier:$("#prefTier").value,background:$("#background").checked,coverMiB:+$("#coverMiB").value};
  $("#prefSave").disabled=true;
- try{paintPrefs(await rpc("saveSettings",{values,cache:$("#libraryDir").value}));applyLanguage(values.language);$("#range").value=values.range;$("#license").value=values.tier;$("#prefMsg").textContent=tr("设置已保存")}
+ try{
+   const old= prefState.values;
+   paintPrefs(await rpc("saveSettings",{values,cache:$("#libraryDir").value}));
+   if(hasFabBrowser && scope==="discover" && (old.apiRoute!==values.apiRoute || (values.apiRoute==="proxy" && old.proxy!==values.proxy))){
+     clearFabCheck();await openFabPage();
+   }
+   applyLanguage(values.language);
+   $("#range").value=values.range;$("#license").value=values.tier;$("#prefMsg").textContent=tr("设置已保存");
+ }
  catch(e){$("#prefMsg").textContent=tr(e.message)}finally{$("#prefSave").disabled=false}
 };
 rpc("settings").then(r=>{applyLanguage(r.values.language);if(!$("#claim").open){$("#range").value=r.values.range;$("#license").value=r.values.tier}});

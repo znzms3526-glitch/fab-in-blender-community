@@ -79,14 +79,16 @@ class FreeTask:
         self.info.pop("retryAt",None)
         self.info["message"]=""
 
-    def process_item(self,db,uid,account,tier,recovering,batch_available):
+    def process_item(self,db,uid,account,tier,recovering,batch_available,retry_only=False):
         recheck=batch_available and not recovering
         if not recheck:
             state=self.request(op="checkFree",uid=uid,account=account)["status"]
             if state=="owned":return "confirmed" if recovering else "owned"
             if state not in {"available","unknown"}:raise ValueError("Fab 结果未知")
-            # A previous write with no reply is only reconciled, never replayed.
-            if recovering:return "verify"
+            if recovering:
+                # Only an explicit retry can replay a legacy/uncertain task after Fab confirms absence.
+                if not retry_only or state!="available":return "verify"
+                recheck=True
             if state=="unknown":return "retry"
         remaining=self.next_submit-time.monotonic()
         if remaining>0:self.pause.wait(remaining)
@@ -100,17 +102,20 @@ class FreeTask:
                 return "verify"
             raise
         status=result["status"]
-        if recheck and status in {"owned","retry"}:return status
+        if recheck and status=="owned":return "confirmed" if recovering else "owned"
+        if recheck and status=="retry":return "verify" if recovering else "retry"
         if recheck and status=="readSeparately":
+            if recovering:return "verify"
             db.execute("UPDATE items SET status='retry' WHERE uid=?",(uid,))
             db.commit()
             return self.process_item(db,uid,account,tier,False,False)
-        if status=="beforeSubmitError":
-            # The host explicitly confirmed that no write was attempted.
-            db.execute("UPDATE items SET status='retry' WHERE uid=?",(uid,))
+        if status in {"beforeSubmitError","rejected"}:
+            # The host confirmed either no POST or an explicit HTTP rejection.
+            next_status="verify" if recovering and status=="beforeSubmitError" else "retry"
+            db.execute("UPDATE items SET status=? WHERE uid=?",(next_status,uid))
             db.commit()
             message=result.get("message","")
-            if any(msg in message for msg in ("响应格式异常","HTTP 404","HTTP 400")):return "retry"
+            if any(msg in message for msg in ("响应格式异常","HTTP 404","HTTP 400")):return next_status
             raise ValueError(message)
         if status not in {"added","confirmed","manual","verify"}:raise ValueError("Fab 结果未知")
         return status
@@ -166,7 +171,7 @@ class FreeTask:
                                 if uid in owned:
                                     consecutive_retries=0
                                     continue
-                                status=self.process_item(db,uid,account,tier,uid in recovering,uid in available)
+                                status=self.process_item(db,uid,account,tier,uid in recovering,uid in available,retry_only)
                                 if status in {"retry","verify"}:
                                     db.execute("INSERT OR IGNORE INTO deferred VALUES(?)",(uid,))
                                 db.execute("UPDATE items SET status=? WHERE uid=?",(status,uid))

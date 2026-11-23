@@ -2,10 +2,12 @@
 const $=s=>document.querySelector(s), el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=cls==="name"?text:tr(text);return n};
 function requestId(){return typeof crypto.randomUUID==="function"?crypto.randomUUID():Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,"0")).join("")}
 const viewSession=requestId();
-const pending=new Map(), choices=new Map(), options=new Map();
+const pending=new Map(), choices=new Map(), options=new Map(), variantNotices=new Map();
 let scope="owned",kind="ALL",page=1,more=false,seq=0,version=0,items=[],jobs=[],toastTimer,queryTimer,lastDone="",menuID=0;
 let category="",tree={},typeLabels={},pollTimer=0,restoreScroll=0;
-const kinds={ALL:"全部资产","3d-model":"模型",material:"材质",decal:"贴花"},scopes={owned:"我的库",local:"已下载",favorites:"收藏",queue:"下载队列"};
+let libraryRevision=null, renderedLibraryRevision=null, librarySignedIn=false, watchingLibrary=false;
+const kinds={ALL:"全部资产","3d-model":"模型",material:"材质",decal:"贴花"};
+const scopes={...(hasFabBrowser?{discover:"探索 Fab"}:{}),owned:"我的 Fab 库",local:"已下载",favorites:"收藏",queue:"下载队列"};
 function rpc(op,data={}){
  const id=requestId();return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject});chrome.webview.postMessage({id,op,...data});});
 }
@@ -23,7 +25,7 @@ chrome.webview.addEventListener("message",async({data})=>{
 function button(text,fn,cls){const b=el("button",cls,text);b.onclick=fn;return b}
 const visibleBranches=new Map(),checking=new Set();
 const batchAssets=new Map();
-let selecting=false, batchGeneration=0, batchPlan=[], batchBusy=false;
+let selecting=false, batchGeneration=0, batchPlan=null, batchBusy=false;
 function selectionTools(){
  $("#multi").hidden=scope==="queue";
  $("#multi").textContent=tr(selecting?"结束多选":"多选");
@@ -33,23 +35,175 @@ function selectionTools(){
  $("#prepare").disabled=!batchAssets.size;
 }
 $("#multi").onclick=()=>{selecting=!selecting;if(!selecting)batchAssets.clear();selectionTools();paint()};
-async function inspectAsset(a,img){
- const dialog=$("#inspect"),spec=dialog.querySelector(".specs"),picture=dialog.querySelector("img");
+function variantLabel(file){
+ const pixels=file.dimensions?.map(([w,h])=>w+"×"+h).join(" / ");
+ return [pixels||tr("贴图尺寸待确认"),tr(file.fmt),file.bytes?size(file.bytes):tr("大小未知"),file.name].join(" · ");
+}
+function texturePicker(k){
+ const select=el("select");
+ for(const value of new Set([1,2,4,8,k])){
+   const option=el("option",null,value+"K");
+   option.value=value;
+   select.append(option);
+ }
+ select.value=k;
+ return select;
+}
+function renderDownloads(target,files,submit,preferred){
+ if(!files.length){target.append(el("p",null,"此商品无可用的 Blender 格式"));return}
+ const label=el("label","field","文件格式"), select=el("select");
+ for(const fmt of new Set(files.map(file=>file.fmt))){
+   const option=el("option",null,fmt);
+   option.value=fmt;
+   select.append(option);
+ }
+ if(files.some(file=>file.fmt===preferred?.fmt))select.value=preferred.fmt;
+ const labelK=el("label","field","首选贴图尺寸"), sizePicker=texturePicker(preferred?.k||2);
+ labelK.append(sizePicker);
+ label.append(select);
+ const list=el("div");
+ const showFiles=()=>list.replaceChildren(...files.filter(file=>file.fmt===select.value)
+   .map(file=>el("p","name",variantLabel(file))));
+ select.onchange=showFiles;
+ showFiles();
+ const add=button("加入下载队列",async()=>{
+   sizePicker.disabled=select.disabled=add.disabled=true;
+   try{await submit({fmt:select.value,k:Number(sizePicker.value)})}
+   finally{sizePicker.disabled=select.disabled=add.disabled=false}
+ },"primary");
+ target.append(labelK,label,list,add);
+}
+function importSettings(copy,textureK,uid){
+ return {hash:copy.hash,k:copy.k,textureK,uid};
+}
+function variantKey(uid,fmt,k){return JSON.stringify([uid,fmt,k])}
+function showVariantResult(uid,requested,result){
+ const key=variantKey(uid,requested.fmt,requested.k);
+ if(result.notice)variantNotices.set(key,result.notice);
+ else variantNotices.delete(key);
+ toast(result.message);
+ document.querySelector('.card[data-uid="'+CSS.escape(uid)+'"]')?.refreshActions?.();
+ if(result.state==="queued")poll();
+}
+function transferVariant(asset,requested,importAfter){
+ return rpc("variant",{uid:asset.uid,fmt:requested.fmt,textureK:requested.k,import:importAfter});
+}
+function localActions(asset,copy,target){
+ const controls=el("div","controls"), feedback=el("p","asset-feedback");
+ feedback.role="status";
+ const custom=el("details","asset-options");
+ custom.append(el("summary",null,"规格与导入选项"));
+ let selected=null;
+ const request=()=>({...importSettings(copy,selection(asset).k,asset.uid),...selected?.()});
+ const use=button("导入",async()=>{
+   use.disabled=true;
+   try{
+     const requested={fmt:copy.fmt,k:selection(asset).k};
+     const result=await transferVariant(asset,requested,true);
+     showVariantResult(asset.uid,requested,result);
+     feedback.textContent=tr(result.message);
+   }catch(e){feedback.textContent=tr(e.message)}
+   finally{use.disabled=false}
+ },"primary");
+ controls.append(use);
+ if(hasFabBrowser && asset.kind!=="decal"){
+   const publish=button("加入 Blender 资产库",async()=>{
+     publish.disabled=true;
+     feedback.textContent=tr("正在生成 Blender 资产…");
+     try{
+       const result=await rpc("addNativeAsset",request());
+       const state=result.created?"已加入 Blender 资产库":result.located?"已在 Blender 中定位":"已在 Blender 资产库";
+       feedback.textContent=tr(state)+" · "+result.library+" · "+result.title;
+       toast(feedback.textContent);
+     }catch(e){feedback.textContent=tr(e.message)}
+     finally{publish.disabled=false}
+   });
+   controls.append(publish);
+ }
+ custom.ontoggle=async()=>{
+   if(!custom.open||custom.dataset.loaded)return;
+   custom.dataset.loaded="1";
+   const loading=el("p",null,"正在读取…");custom.append(loading);
+   try{
+     const result=await rpc("members",importSettings(copy,selection(asset).k,asset.uid));
+     const label=el("label","field","导入模式"), mode=el("select");
+     ["模型","材质","贴花"].forEach((text,index)=>{
+       const option=el("option",null,text);option.value=index;mode.append(option);
+     });
+     mode.value=result.mode;label.append(mode);loading.replaceWith(label);
+     const checks=result.names.map(name=>{
+       const field=el("label","member"), input=el("input");
+       input.type="checkbox";input.checked=result.files.includes(name);
+       field.append(input,document.createTextNode(name));custom.append(field);
+       return [name,input];
+     });
+     selected=()=>({mode:Number(mode.value),files:checks.filter(([,input])=>input.checked).map(([name])=>name)});
+     custom.append(
+       button("按所选文件导入",async()=>toast(await rpc("send",request()))),
+       button("创建独立副本",async()=>toast(await rpc("send",{...request(),independent:true})))
+     );
+   }catch(e){loading.textContent=tr(e.message);delete custom.dataset.loaded}
+ };
+ target.replaceChildren(controls,feedback,custom);
+}
+function inspectAsset(a,img,requestedUnavailable=false){
+ const dialog=$("#inspect"), spec=dialog.querySelector(".specs"), picture=dialog.querySelector("img");
+ const includeImport=scope==="local";
+ const preferred=selection(a);
  dialog.querySelector("h2").textContent=a.title;
- const src=img.currentSrc||img.getAttribute("src")||a.thumb;
- picture.hidden=!src;if(src)picture.src=coverURL(src);else picture.removeAttribute("src");
- spec.replaceChildren(el("strong",null,"已缓存"));
- for(const v of a.local)spec.append(el("p",null,(v.k?v.k+"K · ":"")+tr(v.fmt)+" · "+v.name));
- if(!a.local.length)spec.append(el("p",null,"无"));
- dialog.showModal();
- if(a.localOnly)return;
- const status=el("strong",null,"正在读取 Fab 可用规格…");spec.append(status);
- try{
-   const files=options.get(a.uid)||await rpc("options",{uid:a.uid});
-   if(!status.isConnected||!dialog.open)return;
-   options.set(a.uid,files);status.textContent=tr("Fab 可用文件");
-   for(const f of files)spec.append(el("p",null,[f.fmt,f.name,f.bytes?size(f.bytes):tr("大小未知")].join(" · ")));
- }catch(e){status.textContent=tr(e.message)}
+ const src=img?.currentSrc||img?.getAttribute("src")||a.thumb;
+ picture.hidden=!src;
+ if(src)picture.src=coverURL(src);else picture.removeAttribute("src");
+ spec.replaceChildren();
+ if(a.local.length){
+   const label=el("label","field","已下载"), files=el("select"), commands=el("div","local-actions");
+   files.ariaLabel=tr("已下载");
+   for(const copy of a.local){
+     const option=el("option","name",variantLabel(copy));option.value=copy.hash;files.append(option);
+   }
+   const current=cachedCopy(a,preferred)||a.local[0];
+   const labelK=el("label","field","首选贴图尺寸"), sizePicker=texturePicker(preferred.k);
+   files.value=current.hash;
+   const update=()=>{
+     const copy=a.local[files.selectedIndex];
+     chooseVariant(a,{fmt:copy.fmt,k:Number(sizePicker.value)});
+     localActions(a,copy,commands);
+   };
+   files.onchange=sizePicker.onchange=update;
+   label.append(files);labelK.append(sizePicker);
+   spec.append(label,labelK,commands);localActions(a,current,commands);
+ }
+ if(!a.localOnly && !a.discovery){
+   const target=el("div","remote-files");
+   const list=async()=>{
+     const status=el("p",null,"正在读取 Fab 可用规格…");
+     target.replaceChildren(status);
+     try{
+       const files=await availableFiles(a);
+       if(!target.isConnected||!dialog.open)return;
+       target.replaceChildren();
+       if(requestedUnavailable && files.length)target.append(el("p",null,"Fab 未提供所选格式，请选择可用文件。"));
+       renderDownloads(target,files,async requested=>{
+         const result=await transferVariant(a,requested,includeImport);
+         chooseVariant(a,requested);
+         showVariantResult(a.uid,requested,result);
+         if(result.state!=="missing")dialog.close();
+       },selection(a));
+     }catch(e){target.replaceChildren(el("p",null,e.message),button("重试",list))}
+   };
+   target.append(button("查看其他 Fab 规格",list));spec.append(target);
+   if(!a.local.length||requestedUnavailable)queueMicrotask(list);
+ }
+ if(!a.localOnly){
+   const view=button("在 Fab 查看",()=>{
+     dialog.close();
+     if(hasFabBrowser)discover("https://www.fab.com/listings/"+a.uid);
+     else rpc("viewListing",{uid:a.uid});
+   });
+   spec.append(view);
+ }
+ if(!dialog.open)dialog.showModal();
+ layoutFab();
 }
 $("#inspect header button").onclick=()=>$("#inspect").close();
 document.addEventListener("keydown",e=>{
@@ -60,20 +214,20 @@ document.addEventListener("keydown",e=>{
 });
 async function planBatch(){
  const token=++batchGeneration,k=parseInt($("#batchK").value),fmt=$("#batchFmt").value;
- batchPlan=[];$("#batchRun").disabled=true;$("#batchSummary").textContent=tr("正在核对规格…");
- let cached=0,missing=0,failed=0;const plan=[];
- for(const a of batchAssets.values()){
+ batchPlan=null;$("#batchRun").disabled=true;$("#batchSummary").textContent=tr("正在核对规格…");
+ try{
+   const plan=await rpc("previewBatch",{uids:[...batchAssets.keys()],textureK:k,fmt});
    if(token!==batchGeneration)return;
-   if(localCopy(a,{k,fmt})){cached++;continue}
-   if(a.localOnly||a.discovery){missing++;continue}
-   try{
-     const files=options.get(a.uid)||await rpc("options",{uid:a.uid});options.set(a.uid,files);
-     if(files.some(f=>f.k===k&&f.fmt===fmt))plan.push({uid:a.uid,k,fmt});else missing++;
-   }catch{failed++}
+   batchPlan=plan.token;
+   $("#batchSummary").textContent=[
+     tr("需下载")+" "+plan.download,tr("已缓存")+" "+plan.cached,
+     plan.fallback?tr("缓存贴图与首选尺寸不符或待确认")+" "+plan.fallback:"",
+     tr("无此规格")+" "+plan.missing,tr("未能核对")+" "+plan.failed
+   ].filter(Boolean).join(" · ");
+   $("#batchRun").disabled=!batchPlan;
+ }catch(e){
+   if(token===batchGeneration)$("#batchSummary").textContent=tr(e.message);
  }
- if(token!==batchGeneration)return;
- batchPlan=plan;$("#batchSummary").textContent=tr("需下载")+" "+plan.length+" · "+tr("已缓存")+" "+cached+" · "+tr("无此规格")+" "+missing+" · "+tr("未能核对")+" "+failed;
- $("#batchRun").disabled=!plan.length;
 }
 $("#prepare").onclick=()=>{$("#batch").showModal();planBatch()};
 $("#batchK").onchange=$("#batchFmt").onchange=planBatch;
@@ -81,25 +235,41 @@ $("#batch header button").onclick=()=>{if(!batchBusy)$("#batch").close()};
 $("#batch").oncancel=e=>{if(batchBusy)e.preventDefault()};
 $("#batch").onclose=()=>{++batchGeneration};
 $("#batchRun").onclick=async()=>{
- if(batchBusy)return;
+ if(batchBusy||!batchPlan)return;
  batchBusy=true;$("#batchRun").disabled=$("#batchK").disabled=$("#batchFmt").disabled=true;
- const failed=[];
  try{
-   for(const q of batchPlan){
-     try{await rpc("get",q);batchAssets.delete(q.uid)}
-     catch(e){failed.push((batchAssets.get(q.uid)?.title||q.uid)+" · "+e.message)}
-   }
-   if(failed.length){await planBatch();$("#batchSummary").append(document.createTextNode(" · "+failed.join(" / ")))}
-   else{$("#batch").close();toast("已加入下载队列")}
+   const {submitted,failed}=await rpc("submitBatch",{token:batchPlan});
+   for(const uid of submitted)batchAssets.delete(uid);
+   if(failed.length){
+     const errors=failed.map(({uid,message})=>(batchAssets.get(uid)?.title||uid)+" · "+tr(message));
+     await planBatch();
+     $("#batchSummary").append(document.createTextNode(" · "+errors.join(" / ")));
+   }else{$("#batch").close();toast("已加入下载队列")}
    selectionTools();paint();poll();
+ }catch(e){
+   toast(e.message);
+   await planBatch();
  }finally{batchBusy=false;$("#batchK").disabled=$("#batchFmt").disabled=false}
 };
 function visible(nodes,parent){
- const values=nodes.map(x=>x.slug);if(!values.length||scope==="queue")return [];
- const key=JSON.stringify([scope,parent,values]);
+ const values=nodes.map(x=>x.slug);if(!values.length||scope==="queue"||scope==="discover")return [];
+ const origin=scope, revision=origin==="owned"?libraryRevision:null;
+ if(origin==="owned"&&!librarySignedIn)return [];
+ const key=JSON.stringify([origin,parent,values,revision]);
  if(!visibleBranches.has(key)&&!checking.has(key)){
    checking.add(key);
-   const origin=scope;setTimeout(()=>rpc("presence",{scope:origin,kind:parent,values}).then(r=>{visibleBranches.set(key,new Set(r.found));nav()}).catch(e=>toast(e.message)).finally(()=>checking.delete(key)),120);
+   setTimeout(async()=>{
+     const active=()=>origin!=="owned"||revision===libraryRevision;
+     try{
+       if(!active())return;
+       const result=await rpc("presence",{scope:origin,kind:parent,values,libraryRevision:revision});
+       if(active()){visibleBranches.set(key,new Set(result.found));nav()}
+     }catch(e){
+       if(active()&&e.message!=="Fab 账号正在切换")toast(e.message);
+     }finally{
+       checking.delete(key);
+     }
+   },120);
  }
  const found=visibleBranches.get(key);
  return nodes.filter(x=>found?.has(x.slug));
@@ -116,9 +286,29 @@ function categoryLabel(node){
 function activeCategory(nodes,slug){for(const n of nodes||[]){if(n.slug===slug)return categoryLabel(n);if(slug.startsWith(n.slug+"--"))return activeCategory(n.children,slug)}return slug}
 function nav(){
  selectionTools();
+ const browsing=scope==="discover", inQueue=scope==="queue", assetList=!browsing&&!inQueue;
  const scopesNode=$("#scope");scopesNode.replaceChildren();
- for(const [id,label] of Object.entries(scopes))scopesNode.append(button(label,()=>{scope=id;resetFilters();load()},id===scope?"active":""));
+ for(const [id,label] of Object.entries(scopes)){
+   if(id==="queue")continue;
+   const item=button(label,()=>{scope=id;resetFilters();load()},id===scope?"active":"");
+   item.dataset.scope=id;
+   if(id===scope)item.setAttribute("aria-current","page");
+   scopesNode.append(item);
+ }
+ $("#title").textContent=tr(scopes[scope]);
+ $("#categoryGroup").hidden=!assetList;
+ $("main").classList.toggle("browsing",browsing);
+ $("#searchField").hidden=$("#refresh").hidden=!assetList;
+ $("#fabBrowse").hidden=!browsing;
+ $("#scroll").hidden=browsing;
+ $("#pager").hidden=!assetList;
+ $("#tools").hidden=browsing;
+ $("#tools label").hidden=inQueue;
+ $("#free").hidden=scope!=="owned";
+ $("#add").hidden=scope!=="local";
+ $("#kindText").textContent=tr(inQueue?"按加入顺序下载":(category?activeCategory(tree[kind],category):kinds[kind]||typeLabels[kind]));
  const categories=$("#categories");categories.replaceChildren();
+ if(!assetList)return;
  function choose(type,slug){kind=type;category=slug;page=1;if(scope==="queue")scope="owned";load()}
  function row(type,slug,label,nodes,depth){
    const key=JSON.stringify([type,slug]), group=el("div","tree-row");
@@ -154,11 +344,47 @@ function nav(){
    if(id!=="ALL"&&!present.has(id))continue;
    row(id,"",uiLang==="en"&&!kinds[id]?categoryLabel({slug:id}):label,tree[id],0);
  }
- $("#title").textContent=tr(scopes[scope]);$("#kindText").textContent=tr(scope==="queue"?"按加入顺序下载":(category?activeCategory(tree[kind],category):kinds[kind]||typeLabels[kind]));$("#tools label").hidden=scope==="queue";$("#pager").style.visibility=scope==="queue"?"hidden":"visible";$("#add").hidden=scope!=="local";$("#query").disabled=scope==="queue";
 }
-async function load(refresh=false){
+function updateLibrarySession(session){
+ if(libraryRevision!==null&&session.libraryRevision<=libraryRevision)return false;
+ const changed=libraryRevision!==null;
+ libraryRevision=session.libraryRevision;
+ librarySignedIn=session.signedIn;
+ if(changed){
+   choices.clear();options.clear();variantNotices.clear();
+   for(const key of visibleBranches.keys())if(JSON.parse(key)[0]==="owned")visibleBranches.delete(key);
+   batchAssets.clear();selecting=false;batchPlan=null;
+   claimIdentity="";claimRunning=false;
+   for(const element of document.querySelectorAll("#inspect[open],#claim[open],#batch[open],#fabFiles[open]"))element.close();
+   $("#menu").hidePopover();
+   $("#free").textContent=tr("一键免费入库");
+   restoreScroll=0;
+ }
+ return true;
+}
+async function watchLibrarySession(){
+ if(scope!=="owned"||document.hidden||watchingLibrary)return;
+ watchingLibrary=true;
+ try{
+   const session=await rpc("librarySession");
+   if(scope!=="owned"||document.hidden)return;
+   const changed=updateLibrarySession(session);
+   if(changed)page=1;
+   if(changed||(!$("#grid").hasAttribute("aria-busy")&&renderedLibraryRevision!==libraryRevision))await load();
+ }catch{
+   // A temporary connection failure does not sign the account out.
+ }finally{watchingLibrary=false}
+}
+addEventListener("focus",watchLibrarySession);
+document.addEventListener("visibilitychange",watchLibrarySession);
+setInterval(watchLibrarySession,6000);
+
+async function load(refresh=false,web=null){
  const token=++version;
  watchCovers.disconnect();items=[];nav();
+ layoutFab();
+ if(scope==="discover"){openFabPage(web?.url,web?.lookup);return}
+ ++fabOpenSequence;fabLookup="";
  const grid=$("#grid"),empty=$("#empty");
  grid.replaceChildren();$("#scroll").scrollTop=0;
  $("#page").value=page;$("#prev").disabled=true;$("#next").disabled=true;
@@ -169,13 +395,89 @@ async function load(refresh=false){
  for(let i=0;i<6;i++){
    const tile=el("div","skeleton");tile.setAttribute("aria-hidden","true");fragment.append(tile);
  }
- grid.append(fragment); try{const r=await rpc("page",{scope,kind,category,page,refresh,viewSession,generation:token,query:$("#query").value.trim()});if(token!==version)return;
+ grid.append(fragment);
+ if(scope==="owned")renderedLibraryRevision=null;
+ try{
+ const r=await rpc("page",{scope,kind,category,page,refresh,viewSession,generation:token,query:$("#query").value.trim(),libraryRevision});
+ if(token!==version)return;
+ if(scope==="owned"){
+   updateLibrarySession(r);
+   renderedLibraryRevision=r.libraryRevision;
+   if(!r.signedIn)throw Error("请先登录 Fab");
+ }
  grid.removeAttribute("aria-busy");empty.classList.remove("waiting");page=r.page;more=r.more;items=r.items;nav();$("#page").value=page;$("#total").textContent=tr(r.total?" / "+r.total:"");$("#prev").disabled=page===1;$("#next").disabled=!more;paint();$("#scroll").scrollTop=restoreScroll;restoreScroll=0;saveView();
- }catch(e){if(token===version){grid.replaceChildren();grid.removeAttribute("aria-busy");empty.classList.remove("waiting");empty.replaceChildren(document.createTextNode(tr(e.message)+" "),button("重试",()=>load(true)));if(scope==="owned")empty.append(button("账号登录",async()=>toast(await rpc("login"))))}}
+ }catch(e){if(token===version){
+   grid.replaceChildren();grid.removeAttribute("aria-busy");empty.classList.remove("waiting");
+   empty.replaceChildren(document.createTextNode(tr(e.message)+" "),button("重试",()=>load(true)));
+   if(scope==="owned"){
+     empty.append(button("账号登录",async()=>toast(await rpc("login"))));
+     if(e.message==="Fab 账号正在切换")watchLibrarySession();
+   }
+ }}
 }
 function paint(){watchCovers.disconnect();const grid=$("#grid");grid.replaceChildren();items.forEach(a=>grid.append(card(a)));$("#empty").textContent=tr(items.length?"":"没有匹配的资产");}
-function selection(a){if(!choices.has(a.uid)){const v=a.local[0];choices.set(a.uid,{k:v?.k??2,fmt:v?.fmt||(a.kind==="3d-model"?"FBX":"贴图")})}return choices.get(a.uid)}
-function localCopy(a,c){return a.local.find(f=>f.k===c.k&&f.fmt===c.fmt)}
+function selection(a){if(!choices.has(a.uid)){const v=a.local[0];choices.set(a.uid,{k:v?.k||2,fmt:v?.fmt||(a.kind==="3d-model"?"FBX":"贴图")})}return choices.get(a.uid)}
+function preferredFile(files,selected){
+ const candidates=files.filter(file=>file.fmt===selected.fmt);
+ function distance(file){
+   if(file.dimensions?.length)return Math.min(...file.dimensions.map(pair=>Math.abs(Math.max(...pair)/1024-selected.k)));
+   return file.k?Math.abs(file.k-selected.k):Infinity;
+ }
+ return candidates.sort((a,b)=>distance(a)-distance(b))[0];
+}
+function cachedCopy(a,selected){return preferredFile(a.local,selected)}
+function importFromCard(a,selected){
+ if(scope==="local"||a.localOnly)return true;
+ return a.local.some(file=>file.fmt===selected.fmt && file.dimensions?.some(pair=>Math.max(...pair)===selected.k*1024));
+}
+function chooseVariant(asset,{k,fmt}){
+ choices.set(asset.uid,{k,fmt});
+ document.querySelector('.card[data-uid="'+CSS.escape(asset.uid)+'"]')?.refreshActions?.();
+}
+async function availableFiles(asset){
+ if(!options.has(asset.uid))options.set(asset.uid,await rpc("options",{uid:asset.uid}));
+ return options.get(asset.uid);
+}
+function variantControls(asset,photo,actions){
+ const levels=el("div","levels"), format=el("select");
+ levels.role="group";
+ levels.ariaLabel=levels.title=tr("首选贴图尺寸");
+ format.ariaLabel=tr("文件格式");
+ format.onchange=()=>chooseVariant(asset,{k:selection(asset).k,fmt:format.value});
+ photo.append(levels);actions.append(format);
+ return ()=>{
+   const selected=selection(asset);
+   const known=[...asset.local,...(options.get(asset.uid)||[])];
+   const sizes=[...new Set([1,2,4,8,...known.map(file=>file.k),selected.k].filter(Boolean))];
+   sizes.sort((a,b)=>(a||Infinity)-(b||Infinity));
+   if(sizes.length!==levels.children.length||sizes.some((k,i)=>Number(levels.children[i].dataset.k)!==k)){
+     levels.replaceChildren(...sizes.map(k=>{
+       const option=button(k?k+"K":"原始文件",()=>{
+         const current=selection(asset);
+         if(k===current.k)return;
+         const next={k,fmt:current.fmt};
+         chooseVariant(asset,next);
+       });
+       option.dataset.k=k;
+       option.title=tr("首选贴图尺寸")+" · "+k+"K";
+       return option;
+     }));
+   }
+   for(const option of levels.children){
+     const active=Number(option.dataset.k)===selected.k;
+     option.classList.toggle("chosen",active);
+     option.setAttribute("aria-pressed",String(active));
+   }
+   const defaults=asset.localOnly?[]:asset.kind==="3d-model"?["FBX","GLB"]:["贴图"];
+   const formats=[...new Set([...defaults,...known.map(file=>file.fmt),selected.fmt])];
+   if(formats.length!==format.options.length||formats.some((fmt,i)=>format.options[i].value!==fmt)){
+     format.replaceChildren(...formats.map(fmt=>{
+       const option=el("option",null,fmt);option.value=fmt;return option;
+     }));
+   }
+   format.value=selected.fmt;
+ };
+}
 function coverURL(url){return location.protocol==="fabshelf:"?url.replace(/^https:\/\/covers\.invalid\//,"fabshelf://covers/"):url}
 const coverRequests=new Map();
 function fetchCover(uid){
@@ -197,7 +499,7 @@ const watchCovers=new IntersectionObserver(entries=>{
  }
 },{root:$("#scroll"),rootMargin:"180px"});
 function card(a){
- const c=selection(a), node=el("article","card"),photo=el("div","photo loading"),body=el("div","body");node.append(photo,body);
+ const node=el("article","card"),photo=el("div","photo loading"),body=el("div","body");node.append(photo,body);
  node.dataset.uid=a.uid;
  node.tabIndex=0;
  const img=el("img");img.alt=a.title;img.dataset.uid=a.uid;img.dataset.remote=a.thumb||"";
@@ -223,68 +525,53 @@ function card(a){
    }finally{star.disabled=false}
  },"star");
  star.setAttribute("aria-pressed",String(a.favorite));star.title=tr(a.favorite?"取消收藏":"收藏");photo.append(star);
- const gear=button("⚙",()=>popup(gear,a),"options");gear.title=tr("规格与导入选项");photo.append(gear);
+ const gear=button("⋯",()=>inspectAsset(a,img),"options");gear.title=gear.ariaLabel=tr("规格与导入选项");photo.append(gear);
  const title=el("div","name",a.title);title.title=a.title;body.append(title);
- if(a.discovery){body.append(button("在 Fab 查看 ↗",()=>rpc("viewListing",{uid:a.uid})));return node}
- const levels=el("div","levels");for(const k of (a.localOnly?[...new Set(a.local.map(v=>v.k))]:[1,2,4,8])){const b=button(k?k+"K":"原始文件",()=>{c.k=k;updateControls()},k===c.k?"chosen":"");b.dataset.k=k;b.title=k?"匹配 "+k+"K 或对应 Fab 质量档":"文件未标明贴图分辨率";levels.append(b)}photo.append(levels);
- const row=el("div","actions"),sel=el("select");sel.ariaLabel=tr("文件格式");
- const formats=new Set([...(a.localOnly?[]:a.kind==="3d-model"?["FBX","GLB"]:["贴图"]),...a.local.map(v=>v.fmt),...(options.get(a.uid)||[]).map(v=>v.fmt)]);
- formats.forEach(f=>{const o=el("option",null,f);o.value=f;sel.append(o)});sel.value=c.fmt;sel.onchange=()=>{c.fmt=sel.value;updateControls()};row.append(sel);
- const quick=el("div","cached-actions");
- function cachedButton(copy){
-   const label=(copy.k?copy.k+"K":tr("原始文件"))+" "+tr(copy.fmt);
-   return button(tr("导入")+" "+label,()=>sendCopy(copy),"cached-import");
- }
- async function sendCopy(copy){
-   if(node.dataset.sending)return;
-   node.dataset.sending="true";
-   try{toast(await rpc("send",{hash:copy.hash,k:copy.k}))}
-   finally{delete node.dataset.sending}
+ if(a.discovery){
+   body.append(button("在 Fab 查看",()=>{
+     if(hasFabBrowser)discover("https://www.fab.com/listings/"+a.uid);
+     else rpc("viewListing",{uid:a.uid});
+   },"primary"));
+   return node;
  }
  const primary=button("",async()=>{
-   const copy=localCopy(a,c);
-   if(copy){await sendCopy(copy);return}
-   const wantImport=scope==="local";
-   toast(await rpc("get",{uid:a.uid,k:c.k,fmt:c.fmt,import:wantImport}));poll()
- },"primary");row.append(primary);
- function updateControls(){
-   for(const b of levels.children)b.classList.toggle("chosen",Number(b.dataset.k)===c.k);
-   quick.replaceChildren();
-   if(scope!=="local" && a.local.length){
-     quick.append(el("small",null,"已缓存"));
-     for(const copy of a.local)if(copy!==localCopy(a,c))quick.append(cachedButton(copy));
-     if(quick.children.length===1)quick.append(el("small",null,(c.k?c.k+"K":tr("原始文件"))+" "+tr(c.fmt)));
-   }
-   primary.textContent=tr(localCopy(a,c)?"导入":scope==="local"?"下载并导入":"下载");
-   node.refreshStatus?.();
- }
- const status=el("button","download-status");status.title=tr("下载队列");status.onclick=()=>{scope="queue";load()};
+   const requested=selection(a);
+   primary.disabled=true;
+   try{
+     const result=await transferVariant(a,requested,importFromCard(a,requested));
+     showVariantResult(a.uid,requested,result);
+     if(result.state==="missing"&&node.isConnected&&selection(a)===requested)inspectAsset(a,img,true);
+   }finally{primary.disabled=false}
+ },"primary");
+ const actions=el("div","actions");
+ const textureInfo=el("small","texture-info");
+ const refreshVariants=variantControls(a,photo,actions);
+ actions.append(primary);
+ const status=el("button","download-status");status.title=tr("下载队列");
+ let visibleJob;
+ status.onclick=()=>showQueue(visibleJob?.id);
  node.refreshStatus=()=>{
-   const pending=jobs.filter(j=>j.uid===a.uid&&!["完成","已取消"].includes(j.state));
-   const j=pending.find(j=>j.state==="下载中")||pending.find(j=>j.k===c.k&&j.fmt===c.fmt)||pending[0];
-   status.hidden=!j;
-   if(!j)return;
-   const percent=j.state==="下载中"&&j.total>0?" "+Math.min(99,Math.floor(j.done*100/j.total))+"%":"";
-   status.textContent=[j.k?j.k+"K":"",tr(j.fmt),tr(j.state),percent.trim(),pending.length>1?"+"+(pending.length-1):""].filter(Boolean).join(" ");
+   const c=selection(a), pending=jobs.filter(j=>j.uid===a.uid&&!["完成","已取消"].includes(j.state));
+   visibleJob=pending.find(j=>j.state==="下载中")||pending.find(j=>j.k===c.k&&j.fmt===c.fmt)||pending[0];
+   status.hidden=!visibleJob;
+   if(visibleJob){
+     const {k,fmt,state,total,done}=visibleJob;
+     const percent=state==="下载中"&&total>0?Math.min(99,Math.floor(done*100/total))+"%":"";
+     status.textContent=[k?k+"K":"",tr(fmt),tr(state),percent,pending.length>1?"+"+(pending.length-1):""].filter(Boolean).join(" ");
+   }
  };
- updateControls();body.append(row,quick,status);return node;
-}
-async function popup(anchor,a){
- const menu=$("#menu"),ticket=++menuID;menu.replaceChildren(el("strong",null,a.title));const rect=anchor.getBoundingClientRect();
- menu.style.left=Math.max(8,Math.min(innerWidth-430,rect.right-360))+"px";const below=innerHeight-rect.bottom;menu.style.maxHeight=Math.max(170,Math.min(innerHeight*.72,Math.max(below,rect.top)-16))+"px";menu.style.bottom=below<220?Math.max(8,innerHeight-rect.top+4)+"px":"auto";menu.style.top=below<220?"auto":(rect.bottom+5)+"px";menu.showPopover();
- const c=selection(a),copy=localCopy(a,c);
- if(copy){const m=await rpc("members",{hash:copy.hash,k:c.k});if(ticket!==menuID)return;
- const mode=el("select");["模型","材质","贴花"].forEach((v,i)=>{const o=el("option",null,v);o.value=i;mode.append(o)});mode.value=m.mode;menu.append(mode);
- const checks=[];m.names.forEach(n=>{const l=el("label"),b=el("input");b.type="checkbox";b.checked=m.files.includes(n);checks.push([n,b]);l.append(b,document.createTextNode(" "+n));menu.append(l)});
- menu.append(button("按所选文件导入",async()=>{toast(await rpc("send",{hash:copy.hash,k:c.k,mode:+mode.value,files:checks.filter(v=>v[1].checked).map(v=>v[0])}));menu.hidePopover()},"primary"));
- menu.append(button("创建独立副本",async()=>{toast(await rpc("send",{hash:copy.hash,k:c.k,independent:true,mode:+mode.value,files:checks.filter(v=>v[1].checked).map(v=>v[0])}));menu.hidePopover()}));
- }
- if(a.uid===copy?.hash)return;
- if(a.discovery){menu.append(button("在 Fab 查看 ↗",()=>rpc("viewListing",{uid:a.uid})));return}
- const waiting=el("p",null,"正在读取 Fab 可用规格…");menu.append(waiting);
- try{const fs=options.get(a.uid)||await rpc("options",{uid:a.uid});if(ticket!==menuID)return;options.set(a.uid,fs);waiting.textContent=tr(fs.length?"Fab 可用文件":"该条目没有可用的 Blender 文件");
- fs.forEach(f=>{menu.append(button(f.name+" · "+size(f.bytes),async()=>{c.k=f.k||c.k;c.fmt=f.fmt;toast(await rpc("get",{uid:a.uid,k:c.k,fmt:c.fmt,file:f.uid,import:scope==="local"}));poll();menu.hidePopover();paint()},"choice"))});
- }catch(e){waiting.textContent=tr(e.message)}
+ node.refreshActions=()=>{
+   refreshVariants();
+   const selected=selection(a), copy=cachedCopy(a,selected);
+   const dims=copy?.dimensions?.map(([w,h])=>w+"×"+h).join(" / ");
+   textureInfo.textContent=tr(variantNotices.get(variantKey(a.uid,selected.fmt,selected.k))
+     || (dims?"已缓存贴图 "+dims:"贴图尺寸待确认"));
+   primary.textContent=tr(importFromCard(a,selected)?"导入":"下载");
+   node.refreshStatus();
+ };
+ node.refreshActions();
+ body.append(actions,textureInfo,status);
+ return node;
 }
 function size(n){return (n/1048576).toFixed(1)+" MiB"}
 function projectHint(state){
@@ -297,23 +584,41 @@ function projectHint(state){
 }
 chrome.webview.addEventListener("message",({data})=>{if(data.project)projectHint(data.project)});
 rpc("projectState").then(projectHint);
+let queueTarget="",queueLocated="";
+function showQueue(id){
+ queueLocated=queueTarget=id||"";
+ scope="queue";
+ load();
+}
 function transferSummary(){
  const active=jobs.find(j=>j.state==="下载中"), count=state=>jobs.filter(j=>j.state===state).length;
  const summary=$("#transfer"), bar=summary.querySelector("progress");
  const states=["等待","暂停","失败","完成"].map(state=>count(state)?tr(state)+" "+count(state):"").filter(Boolean);
- summary.hidden=!active&&!states.length;
- if(summary.hidden)return;
  summary.querySelector("strong").textContent=active?tr("下载中")+(active.total?" "+Math.min(99,Math.floor(active.done*100/active.total))+"%":""):tr("下载队列");
- summary.querySelector("span").textContent=[active?.title,active?.speed?size(active.speed)+"/s":"",...states].filter(Boolean).join(" · ");
+ const details=summary.querySelector("span");
+ const label=[active?.title,active?.speed?size(active.speed)+"/s":"",...states].filter(Boolean).join(" · ");
+ const pending=count("等待")+count("暂停");
+ details.textContent=count("失败")?tr("失败")+" "+count("失败"):pending||"";
+ details.hidden=!details.textContent;
+ summary.title=[tr("下载队列"),label].filter(Boolean).join(" · ");
  bar.hidden=!active;if(active?.total)bar.value=100*active.done/active.total;else bar.removeAttribute("value");
 }
-$("#transfer").onclick=()=>{scope="queue";load()};
+$("#transfer").onclick=()=>showQueue(jobs.find(job=>job.state==="失败")?.id);
 function paintJobs(){const grid=$("#grid");grid.replaceChildren();$("#empty").textContent=tr(jobs.length?"":"队列为空");
- for(const j of jobs){const row=el("div","queue");row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;p.value=j.done;row.append(p);
- row.append(el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error].filter(Boolean).join(" · ")));
+ let focused;
+ for(const j of jobs){const row=el("div","queue");row.dataset.job=j.id;row.tabIndex=-1;
+ if(j.id===queueTarget)focused=row;
+ if(j.id===queueLocated)row.classList.add("located");
+ row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;p.value=j.done;row.append(p);
+ row.append(el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · ")));
  const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",!["完成","已取消"].includes(j.state)]]){
  if(on)bar.append(button(label,async()=>{await rpc("control",{job:j.id,action});await poll()}))}
  row.append(bar);grid.append(row)}
+ if(focused){
+   queueTarget="";
+   focused.scrollIntoView({block:"center"});
+   focused.focus({preventScroll:true});
+ }
 }
 for(const [label,word] of [["家具","Furniture"],["建筑","Building"],["植物","Plant"],["岩石","Rock"],["木材","Wood"],["食物","Food"]]){
  $("#topics").append(button(label,()=>{$("#query").value=word;if(scope==="queue")scope="owned";page=1;load()}));
@@ -328,6 +633,10 @@ async function poll(){
    for(const job of jobs){
      if(job.state!=="完成" || completed.has(job.id))continue;
      completed.add(job.id);
+     if(job.notice&&job.textureK){
+       variantNotices.set(variantKey(job.uid,job.fmt,job.textureK),job.notice);
+       toast(job.title+" · "+job.notice);
+     }
      for(const key of visibleBranches.keys())if(JSON.parse(key)[0]==="local")visibleBranches.delete(key);
      const index=items.findIndex(i=>i.uid===job.uid);
      if(index>=0 && scope!=="queue"){
@@ -344,14 +653,14 @@ async function poll(){
  }
 }
 function saveView(){
- if(scope==="queue")return;
+ if(scope==="queue"||scope==="discover")return;
  try{localStorage.setItem("fab-view-v4",JSON.stringify({scope,kind,category,page,query:$("#query").value,zoom:$("#zoom").value,scroll:$("#scroll").scrollTop}))}catch{}
 }
 let saveTimer;
 $("#scroll").onscroll=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(saveView,180)};
 window.addEventListener("pagehide",saveView);$("#query").oninput=()=>{clearTimeout(queryTimer);queryTimer=setTimeout(()=>{page=1;load()},300)};
 $("#page").onchange=e=>{page=Math.max(1,+e.target.value||1);load()};$("#prev").onclick=()=>{page--;load()};$("#next").onclick=()=>{page++;load()};
-$("#zoom").oninput=e=>document.documentElement.style.setProperty("--card",e.target.value+"px");$("#refresh").onclick=()=>{visibleBranches.clear();load(true)};
+$("#zoom").oninput=e=>document.documentElement.style.setProperty("--card",e.target.value+"px");$("#refresh").onclick=()=>{options.clear();variantNotices.clear();visibleBranches.clear();load(true)};
 $("#cache").onclick=async()=>{
  const box=$("#menu");++menuID;
  const stats=await rpc("cacheStats");
@@ -371,7 +680,9 @@ $("#login").onclick=async()=>{
      confirm.disabled=true;
      try{
        toast(await rpc("logout"));++claimToken;claimIdentity="";claimRunning=false;clearInterval(claimTimer);
-       choices.clear();options.clear();visibleBranches.clear();checking.clear();batchAssets.clear();selecting=false;
+       choices.clear();options.clear();variantNotices.clear();visibleBranches.clear();checking.clear();batchAssets.clear();selecting=false;
+       clearFabCheck();
+       if(fabOpened)rpc("fabBrowserRefresh").catch(()=>{});
        menu.hidePopover();scope="local";resetFilters();await load();
      }catch(e){toast(e.message)}finally{confirm.disabled=false}
    });
@@ -380,8 +691,12 @@ $("#login").onclick=async()=>{
 };$("#add").onclick=async()=>{const r=await rpc("pick");if(r){toast(r);load()}};
 try{
  const v=JSON.parse(localStorage.getItem("fab-view-v4")||"null");
- if(v&&scopes[v.scope]){scope=v.scope;kind=v.kind;category=v.category||"";page=v.page||1;restoreScroll=v.scroll||0;$("#query").value=v.query||"";$("#zoom").value=v.zoom||230;$("#zoom").oninput({target:$("#zoom")})}
+ if(v&&scopes[v.scope]&&v.scope!=="discover"&&v.scope!=="queue"){scope=v.scope;kind=v.kind;category=v.category||"";page=v.page||1;restoreScroll=v.scroll||0;$("#query").value=v.query||"";$("#zoom").value=v.zoom||230;$("#zoom").oninput({target:$("#zoom")})}
 }catch{}
+bindFabBrowser();
+const narrowGallery=matchMedia("(max-width: 880px)");
+const syncCategories=()=>{$("#categoryGroup").open=!narrowGallery.matches};
+narrowGallery.addEventListener("change",syncCategories);syncCategories();
 load();poll();
 rpc("taxonomy").then(r=>{tree=r.tree;typeLabels=r.types;nav()}).catch(e=>toast(e.message));
 
