@@ -6,6 +6,7 @@ const pending=new Map(), choices=new Map(), options=new Map(), variantNotices=ne
 let scope="owned",kind="ALL",page=1,more=false,seq=0,version=0,items=[],jobs=[],toastTimer,queryTimer,lastDone="",menuID=0;
 let category="",tree={},typeLabels={},pollTimer=0,restoreScroll=0;
 let libraryRevision=null, renderedLibraryRevision=null, librarySignedIn=false, watchingLibrary=false;
+let libraryContentRevision=0, renderedLibraryContentRevision=null;
 const kinds={ALL:"全部资产","3d-model":"模型",material:"材质",decal:"贴花"};
 const scopes={...(hasFabBrowser?{discover:"探索 Fab"}:{}),owned:"我的 Fab 库",local:"已下载",favorites:"收藏",queue:"下载队列"};
 function rpc(op,data={}){
@@ -302,12 +303,13 @@ $("#batchRun").onclick=async()=>{
 function visible(nodes,parent){
  const values=nodes.map(x=>x.slug);if(!values.length||scope==="queue"||scope==="discover")return [];
  const origin=scope, revision=origin==="owned"?libraryRevision:null, source=origin==="local"?localSource:"all";
+ const contentRevision=origin==="owned"?libraryContentRevision:null;
  if(origin==="owned"&&!librarySignedIn)return [];
- const key=JSON.stringify([origin,parent,values,revision,source]);
+ const key=JSON.stringify([origin,parent,values,revision,source,contentRevision]);
  if(!visibleBranches.has(key)&&!checking.has(key)){
    checking.add(key);
    setTimeout(async()=>{
-     const active=()=>origin!=="owned"||revision===libraryRevision;
+     const active=()=>origin!=="owned"||(revision===libraryRevision&&contentRevision===libraryContentRevision);
      try{
        if(!active())return;
        const result=await rpc("presence",{scope:origin,kind:parent,values,libraryRevision:revision,source});
@@ -397,13 +399,22 @@ function nav(){
  }
 }
 function updateLibrarySession(session){
- if(libraryRevision!==null&&session.libraryRevision<=libraryRevision)return false;
- const changed=libraryRevision!==null;
- libraryRevision=session.libraryRevision;
- librarySignedIn=session.signedIn;
- if(changed){
-   choices.clear();options.clear();variantNotices.clear();
+ if(libraryRevision!==null&&session.libraryRevision<libraryRevision)return false;
+ const changedAccount=libraryRevision!==session.libraryRevision;
+ const alreadyLoaded=libraryRevision!==null;
+ const content=session.libraryContentRevision??0;
+ if(changedAccount||content>libraryContentRevision){
    for(const key of visibleBranches.keys())if(JSON.parse(key)[0]==="owned")visibleBranches.delete(key);
+ }
+ if(!changedAccount){
+   libraryContentRevision=Math.max(libraryContentRevision,content);
+   return false;
+ }
+ libraryRevision=session.libraryRevision;
+ libraryContentRevision=content;
+ librarySignedIn=session.signedIn;
+ if(alreadyLoaded){
+   choices.clear();options.clear();variantNotices.clear();
    batchAssets.clear();selecting=false;batchPlan=null;
    claimIdentity="";claimRunning=false;
    for(const element of document.querySelectorAll("#inspect[open],#claim[open],#batch[open],#fabFiles[open]"))element.close();
@@ -421,7 +432,11 @@ async function watchLibrarySession(){
    if(scope!=="owned"||document.hidden)return;
    const changed=updateLibrarySession(session);
    if(changed)page=1;
-   if(changed||(!$("#grid").hasAttribute("aria-busy")&&renderedLibraryRevision!==libraryRevision))await load();
+   const stale=renderedLibraryRevision!==libraryRevision||renderedLibraryContentRevision!==libraryContentRevision;
+   if(changed||(!$("#grid").hasAttribute("aria-busy")&&stale)){
+     if(!changed)restoreScroll=$("#scroll").scrollTop;
+     await load();
+   }
  }catch{
    // A temporary connection failure does not sign the account out.
  }finally{watchingLibrary=false}
@@ -450,7 +465,9 @@ async function load(refresh=false,web=null){
    const tile=el("div","skeleton");tile.setAttribute("aria-hidden","true");fragment.append(tile);
  }
  grid.append(fragment);
- if(scope==="owned")renderedLibraryRevision=null;
+ if(scope==="owned"){
+   renderedLibraryRevision=null;renderedLibraryContentRevision=null;
+ }
  const requestedBridgeRevision=bridgeState?.revision;
  try{
  const r=await rpc("page",{scope,kind,category,page,refresh,viewSession,generation:token,query:$("#query").value.trim(),libraryRevision,source:localSource});
@@ -462,12 +479,16 @@ async function load(refresh=false,web=null){
    renderedBridgeRevision=r.bridgeRevision;
  }
  if(scope==="owned"){
+   if(libraryRevision!==null&&(r.libraryRevision<libraryRevision||
+      (r.libraryRevision===libraryRevision&&(r.libraryContentRevision??0)<libraryContentRevision)))return load();
    updateLibrarySession(r);
    renderedLibraryRevision=r.libraryRevision;
+   renderedLibraryContentRevision=r.libraryContentRevision??0;
    if(!r.signedIn)throw Error("请先登录 Fab");
  }
  grid.removeAttribute("aria-busy");empty.classList.remove("waiting");page=r.page;more=r.more;items=r.items;nav();$("#page").value=page;$("#total").textContent=tr(r.total?" / "+r.total:"");$("#prev").disabled=page===1;$("#next").disabled=!more;paint();$("#scroll").scrollTop=restoreScroll;restoreScroll=0;saveView();
  }catch(e){if(token===version){
+   if(scope==="owned"&&e.message==="Fab 素材库已更新，请重新加载")return load();
    grid.replaceChildren();grid.removeAttribute("aria-busy");empty.classList.remove("waiting");
    empty.replaceChildren(document.createTextNode(tr(e.message)+" "),button("重试",()=>load(true)));
    if(scope==="owned"){

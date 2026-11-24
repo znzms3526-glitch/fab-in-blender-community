@@ -43,7 +43,9 @@ async function fabRequest(q) {
       if(allowSignedOut)return {uid:""};
       throw Error("请先登录 Fab");
     }
-    return {uid:me.uid,name:me.displayName||"",accepted:me.hasAcceptedBuyerTos===true};
+    // Fab's consent fields are status enums. The official UI accepts exactly "accepted".
+    return {uid:me.uid,name:me.displayName||"",accepted:me.hasAcceptedBuyerTos==="accepted",
+            acceptedUnreal:me.hasAcceptedBuyerUnrealTos==="accepted"};
   }
   async function checkLibraryAccount(){
     if(q.account && (await account(true)).uid!==q.account)throw Error("Fab 账号正在切换");
@@ -53,6 +55,7 @@ async function fabRequest(q) {
     if(me.uid!==q.account)throw Error("账号已变更，任务已暂停");
     return me;
   }
+  const acceptsBuyerTerms = (me, license) => license.slug==="legacy-uem"?me.acceptedUnreal:me.accepted;
   if(q.op==="account")return account(q.allowSignedOut===true);
   if(q.op==="presence"){
     await checkLibraryAccount();
@@ -155,17 +158,18 @@ async function fabRequest(q) {
     try{
       if(q.recheckOwnership && current!==false)return {status:current===true?"owned":"retry"};
       const [d,p]=await Promise.all([get(base),get(base+"/prices-infos","no-store")]);
-      if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle" || !me.accepted)return {status:"manual"};
+      if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle")return {status:"manual"};
       const licenses=Array.isArray(d.licenses)?d.licenses:[];
       const l=licenses.find(l=>l.slug===q.tier)||licenses.find(l=>l.isCc0||l.isCc);
       const offer=p.offers?.find(o=>o.offerId===l?.offerId);
       if(!offer||!l?.offerId)return {status:"manual"};
+      if(!acceptsBuyerTerms(me,l))return {status:"manual"};
       if(typeof offer.price!=="number" || offer.price!==0)return {status:"manual"};
       if(offer.discountedPrice!=null && offer.discountedPrice!==0)return {status:"manual"};
       const token=()=>document.cookie.split(";").map(c=>c.trim()).find(c=>c.startsWith("fab_csrftoken="))?.slice(14);
       if(!token())await fetch("/i/csrf",{credentials:"same-origin"});
       if(!token())throw Error("Fab 登录验证已过期");
-      await claimAccount();
+      if(!acceptsBuyerTerms(await claimAccount(),l))return {status:"manual"};
       offerId=l.offerId;
       csrf=decodeURIComponent(token()||"");
       if(!csrf)throw Error("Fab 登录验证已过期");

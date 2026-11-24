@@ -83,6 +83,9 @@ class Gallery:
         self.library_session_lock=threading.Lock()
         self.library_account=None
         self.library_revision=0
+        self.library_content_revision=0
+        self.library_head=None
+        self.library_head_checked=0.0
         self.listing_checks={}
         self.batch_plans={}
         self.online_revision=0
@@ -181,6 +184,8 @@ class Gallery:
             self.cursors.clear()
             self.facets.clear()
             self.formats.clear()
+            self.library_head=None
+            self.library_head_checked=0.0
 
     def remember_library_account(self, uid):
         with self.lock:
@@ -208,6 +213,39 @@ class Gallery:
             if uid:
                 self.logged_out=False
             return self.remember_library_account(uid)
+
+    def library_stamp(self, data):
+        return tuple(sorted(item["uid"] for item in data["items"] if item.get("uid")))
+
+    def library_status(self):
+        account, revision = self.library_session()
+        with self.lock:
+            now = time.monotonic()
+            check = bool(account) and revision == self.library_revision and not self.claims.running and (
+                now - self.library_head_checked >= 12)
+            if check:
+                self.library_head_checked = now
+        if check:
+            try:
+                data = self.api(dict(op="library", kind="ALL", cursor="", account=account))
+            except ValueError:
+                # A failed freshness check leaves the last verified library visible.
+                pass
+            else:
+                head = self.library_stamp(data)
+                with self.lock:
+                    if revision == self.library_revision and (head or not data["next"]):
+                        has_cached_view = any(key[0] == "library" for key, _ in self.page_cache)
+                        if head != self.library_head and (self.library_head is not None or has_cached_view):
+                            self.library_content_revision += 1
+                            self.page_cache = {key: value for key, value in self.page_cache.items()
+                                               if key[0][0] != "library"}
+                            self.cursors = {key: value for key, value in self.cursors.items() if key[0] != "library"}
+                            self.facets.clear()
+                        self.library_head = head
+        with self.lock:
+            return dict(libraryRevision=self.library_revision, libraryContentRevision=self.library_content_revision,
+                        signedIn=bool(self.library_account))
 
     def speed_test(self,proxy):
         proxy=network.proxy_address(proxy)
@@ -624,7 +662,9 @@ class Gallery:
         session={}
         if is_library:
             account,revision=self.library_session(q.get("id"))
-            session=dict(libraryRevision=revision,signedIn=bool(account))
+            with self.lock:
+                content_revision=self.library_content_revision
+            session=dict(libraryRevision=revision,libraryContentRevision=content_revision,signedIn=bool(account))
             if not account:
                 return dict(items=[],page=1,more=False,total=1,**session)
             if q.get("libraryRevision") not in (None,revision):
@@ -646,13 +686,20 @@ class Gallery:
                 index+=1
             info=dict(page=index,more=more,total=None if more else index)
             with self.lock:
-                if not is_library or revision==self.library_revision:
+                if not is_library or (revision==self.library_revision and content_revision==self.library_content_revision):
+                    if is_library and index==1 and kind=="ALL" and not terms and not category and self.library_head is None:
+                        head=self.library_stamp(data)
+                        if head or not data["next"]:
+                            self.library_head=head
+                            self.library_head_checked=time.monotonic()
                     self.cursors.setdefault(key,{}).update(cursors)
                     if len(self.page_cache)>=48:self.page_cache.pop(next(iter(self.page_cache)))
                     self.page_cache[(key,page)]=(time.monotonic(),data,info)
         cards=[self.card(r) for r in data["items"]]
         if is_library and revision!=self.library_revision:
             raise ValueError("Fab 账号正在切换")
+        if is_library and content_revision!=self.library_content_revision:
+            raise ValueError("Fab 素材库已更新，请重新加载")
         return dict(items=cards,**info,**session)
 
     def options(self,uid,*,refresh=False):
@@ -1314,15 +1361,17 @@ class Gallery:
             if scope=="owned":
                 with self.lock:
                     revision=self.library_revision
+                    content_revision=self.library_content_revision
                     account=self.library_account
                     if not account or q.get("libraryRevision")!=revision:
                         return dict(found=[])
-                    key=(revision,kind,tuple(values))
+                    key=(revision,content_revision,kind,tuple(values))
                     prior=self.facets.get(key)
                 if prior and time.monotonic()-prior[0]<300:return prior[1]
                 result=self.api(dict(op="presence",kind=kind,values=values,account=account))
                 with self.lock:
-                    if revision==self.library_revision:self.facets[key]=(time.monotonic(),result)
+                    if revision==self.library_revision and content_revision==self.library_content_revision:
+                        self.facets[key]=(time.monotonic(),result)
                 return result
             rows=self.local_rows(scope, q.get("source", "all"))
             if not kind:return dict(found=list({r.get("kind") for r in rows if r.get("kind")}))
@@ -1361,8 +1410,7 @@ class Gallery:
         if op=="submitBatch":return self.submit_batch(q)
         if op=="account":return self.api(dict(op="account"))
         if op=="librarySession":
-            uid,revision=self.library_session()
-            return dict(libraryRevision=revision,signedIn=bool(uid))
+            return self.library_status()
         if op=="logout":
             self.claims.pause.set()
             with self.library_session_lock:
