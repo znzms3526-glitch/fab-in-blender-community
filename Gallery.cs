@@ -85,7 +85,27 @@ class Gallery : Form {
                             Process.Start(new ProcessStartInfo("https://www.fab.com/listings/"+uid){UseShellExecute=true});
                         core.PostWebMessageAsJson(json.Serialize(new{id=msg["id"],result=""}));return;
                     }
-                    if(msg.ContainsKey("op") && (string)msg["op"]=="pick"){
+                    if(op=="bridgeScan"){
+                        msg.Remove("path");
+                        object choose;
+                        if(msg.TryGetValue("choose",out choose) && choose is bool && (bool)choose){
+                            var initial=Field(msg,"directory");
+                            if(!Directory.Exists(initial))
+                                initial=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),"Megascans Library");
+                            using(var dialog=new FolderBrowserDialog{
+                                Description=Field(msg,"caption") ?? "Choose the Quixel Bridge library folder",
+                                ShowNewFolderButton=false,
+                                SelectedPath=Directory.Exists(initial)?initial:""
+                            }){
+                                if(dialog.ShowDialog(this)!=DialogResult.OK){
+                                    core.PostWebMessageAsJson(json.Serialize(new{id=msg["id"],result=""}));return;
+                                }
+                                msg["path"]=dialog.SelectedPath;
+                            }
+                        }
+                        text=json.Serialize(msg);
+                    }
+                    if(op=="pick"){
                         using(var dialog=new OpenFileDialog{Filter="资产文件|*.zip;*.fbx;*.glb;*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.exr;*.tga"}){
                             if(dialog.ShowDialog(this)!=DialogResult.OK){core.PostWebMessageAsJson(json.Serialize(new{id=msg["id"],result=""}));return;}
                             msg["path"]=dialog.FileName; text=json.Serialize(msg);

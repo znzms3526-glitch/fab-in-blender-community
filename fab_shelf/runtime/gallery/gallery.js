@@ -27,10 +27,11 @@ const visibleBranches=new Map(),checking=new Set();
 const batchAssets=new Map();
 let selecting=false, batchGeneration=0, batchPlan=null, batchBusy=false;
 function selectionTools(){
- $("#multi").hidden=scope==="queue";
+ const hidden=scope==="queue"||(scope==="local"&&localSource==="bridge");
+ $("#multi").hidden=hidden;
  $("#multi").textContent=tr(selecting?"结束多选":"多选");
  $("#multi").setAttribute("aria-pressed",String(selecting));
- $("#prepare").hidden=scope==="queue"||!selecting;
+ $("#prepare").hidden=hidden||!selecting;
  $("#prepare").textContent=tr("批量下载")+" ("+batchAssets.size+")";
  $("#prepare").disabled=!batchAssets.size;
 }
@@ -120,6 +121,44 @@ function localActions(asset,copy,target){
    });
    controls.append(publish);
  }
+ const deleteConfirm=el("div","delete-confirm");
+ deleteConfirm.hidden=true;
+ const deleteBtn=button("删除本地文件",()=>{
+   deleteConfirm.hidden=false;
+   keepBtn.focus();
+ },"danger");
+ const keepBtn=button("返回",()=>{
+   deleteConfirm.hidden=true;
+   deleteBtn.focus();
+ });
+ const confirmDeleteBtn=button("确认删除",async()=>{
+   confirmDeleteBtn.disabled=keepBtn.disabled=deleteBtn.disabled=true;
+   try{
+     const result=await rpc("deleteLocal",{hash:copy.hash,uid:asset.localOnly?"":asset.uid});
+     toast(result.message);
+     for(const key of [...variantNotices.keys()])if(JSON.parse(key)[0]===asset.uid)variantNotices.delete(key);
+     for(const key of visibleBranches.keys())if(["local","favorites"].includes(JSON.parse(key)[0]))visibleBranches.delete(key);
+     $("#inspect").close();
+     if(scope==="local"||scope==="favorites"){
+       restoreScroll=$("#scroll").scrollTop;
+       await load();
+     }else{
+       const index=items.findIndex(i=>i.uid===asset.uid);
+       if(index>=0){
+         const updated=await rpc("card",{uid:asset.uid});
+         items[index]=updated;
+         $("#grid").querySelector('[data-uid="'+CSS.escape(asset.uid)+'"]')?.replaceWith(card(updated));
+       }
+     }
+   }catch(e){
+     feedback.textContent=tr(e.message);
+     deleteConfirm.hidden=true;
+   }finally{confirmDeleteBtn.disabled=keepBtn.disabled=deleteBtn.disabled=false}
+ },"danger");
+ const deleteRow=el("div","controls");
+ deleteRow.append(keepBtn,confirmDeleteBtn);
+ deleteConfirm.append(el("p",null,"确认删除此本地缓存？仅删除本机文件，不影响 Epic 账号云端资产。"),deleteRow);
+ controls.append(deleteBtn);
  custom.ontoggle=async()=>{
    if(!custom.open||custom.dataset.loaded)return;
    custom.dataset.loaded="1";
@@ -131,6 +170,9 @@ function localActions(asset,copy,target){
        const option=el("option",null,text);option.value=index;mode.append(option);
      });
      mode.value=result.mode;label.append(mode);loading.replaceWith(label);
+     if(result.modelCount>1){
+       custom.append(el("p","multi-model-hint","包内含 "+result.modelCount+" 个模型文件，已自动优先选择主模型；如需其他部件请在下方勾选切换。"));
+     }
      const checks=result.names.map(name=>{
        const field=el("label","member"), input=el("input");
        input.type="checkbox";input.checked=result.files.includes(name);
@@ -144,7 +186,7 @@ function localActions(asset,copy,target){
      );
    }catch(e){loading.textContent=tr(e.message);delete custom.dataset.loaded}
  };
- target.replaceChildren(controls,feedback,custom);
+ target.replaceChildren(controls,deleteConfirm,feedback,custom);
 }
 function inspectAsset(a,img,requestedUnavailable=false){
  const dialog=$("#inspect"), spec=dialog.querySelector(".specs"), picture=dialog.querySelector("img");
@@ -155,6 +197,12 @@ function inspectAsset(a,img,requestedUnavailable=false){
  picture.hidden=!src;
  if(src)picture.src=coverURL(src);else picture.removeAttribute("src");
  spec.replaceChildren();
+ if(a.bridge){
+   bridgeAssetDetails(a,spec);
+   if(!dialog.open)dialog.showModal();
+   layoutFab();
+   return;
+ }
  if(a.local.length){
    const label=el("label","field","已下载"), files=el("select"), commands=el("div","local-actions");
    files.ariaLabel=tr("已下载");
@@ -253,16 +301,16 @@ $("#batchRun").onclick=async()=>{
 };
 function visible(nodes,parent){
  const values=nodes.map(x=>x.slug);if(!values.length||scope==="queue"||scope==="discover")return [];
- const origin=scope, revision=origin==="owned"?libraryRevision:null;
+ const origin=scope, revision=origin==="owned"?libraryRevision:null, source=origin==="local"?localSource:"all";
  if(origin==="owned"&&!librarySignedIn)return [];
- const key=JSON.stringify([origin,parent,values,revision]);
+ const key=JSON.stringify([origin,parent,values,revision,source]);
  if(!visibleBranches.has(key)&&!checking.has(key)){
    checking.add(key);
    setTimeout(async()=>{
      const active=()=>origin!=="owned"||revision===libraryRevision;
      try{
        if(!active())return;
-       const result=await rpc("presence",{scope:origin,kind:parent,values,libraryRevision:revision});
+       const result=await rpc("presence",{scope:origin,kind:parent,values,libraryRevision:revision,source});
        if(active()){visibleBranches.set(key,new Set(result.found));nav()}
      }catch(e){
        if(active()&&e.message!=="Fab 账号正在切换")toast(e.message);
@@ -275,7 +323,7 @@ function visible(nodes,parent){
  return nodes.filter(x=>found?.has(x.slug));
 }
 function resetFilters(){
- clearTimeout(queryTimer);kind="ALL";category="";page=1;restoreScroll=0;$("#query").value="";
+ clearTimeout(queryTimer);kind="ALL";category="";localSource="all";page=1;restoreScroll=0;$("#query").value="";
 }
 const expanded=new Set(JSON.parse(localStorage.getItem("fab-expanded-v1")||"[]"));
 function revealSelection(){if(kind==="ALL")return;expanded.add(JSON.stringify([kind,""]));let slug="";for(const part of category.split("--").filter(Boolean)){slug=slug?slug+"--"+part:part;expanded.add(JSON.stringify([kind,slug]))}}
@@ -304,8 +352,11 @@ function nav(){
  $("#pager").hidden=!assetList;
  $("#tools").hidden=browsing;
  $("#tools label").hidden=inQueue;
+ $("#clearQueue").hidden=!inQueue;
+ $("#clearQueue").disabled=!jobs.some(j=>!j.active&&["完成","已取消","失败"].includes(j.state));
  $("#free").hidden=scope!=="owned";
  $("#add").hidden=scope!=="local";
+ bridgeToolbar(scope==="local");
  $("#kindText").textContent=tr(inQueue?"按加入顺序下载":(category?activeCategory(tree[kind],category):kinds[kind]||typeLabels[kind]));
  const categories=$("#categories");categories.replaceChildren();
  if(!assetList)return;
@@ -342,7 +393,7 @@ function nav(){
     return rank(a)-rank(b);
  })){
    if(id!=="ALL"&&!present.has(id))continue;
-   row(id,"",uiLang==="en"&&!kinds[id]?categoryLabel({slug:id}):label,tree[id],0);
+   row(id,"",uiLang==="en"&&!kinds[id]?categoryLabel({slug:id}):label,scope==="local"&&localSource==="bridge"?null:tree[id],0);
  }
 }
 function updateLibrarySession(session){
@@ -381,6 +432,7 @@ setInterval(watchLibrarySession,6000);
 
 async function load(refresh=false,web=null){
  const token=++version;
+ renderedBridgeRevision=null;
  watchCovers.disconnect();items=[];nav();
  layoutFab();
  if(scope==="discover"){openFabPage(web?.url,web?.lookup);return}
@@ -389,6 +441,8 @@ async function load(refresh=false,web=null){
  grid.replaceChildren();$("#scroll").scrollTop=0;
  $("#page").value=page;$("#prev").disabled=true;$("#next").disabled=true;
  if(scope==="queue"){empty.classList.remove("waiting");grid.removeAttribute("aria-busy");paintJobs();poll();return}
+ if((scope==="local"||scope==="favorites")&&(!bridgeState||refresh)&&!bridgeActionPending)pollBridgeLibrary();
+ if(scope!=="local"||localSource!=="bridge")loadTaxonomy();
  grid.setAttribute("aria-busy","true");
  empty.textContent=tr("正在加载"+scopes[scope]+"…");empty.classList.add("waiting");
  const fragment=document.createDocumentFragment();
@@ -397,9 +451,16 @@ async function load(refresh=false,web=null){
  }
  grid.append(fragment);
  if(scope==="owned")renderedLibraryRevision=null;
+ const requestedBridgeRevision=bridgeState?.revision;
  try{
- const r=await rpc("page",{scope,kind,category,page,refresh,viewSession,generation:token,query:$("#query").value.trim(),libraryRevision});
+ const r=await rpc("page",{scope,kind,category,page,refresh,viewSession,generation:token,query:$("#query").value.trim(),libraryRevision,source:localSource});
  if(token!==version)return;
+ if(bridgeAffectsView()&&typeof r.bridgeRevision==="string"){
+   const current=bridgeState?.revision;
+   if(typeof current==="string"&&!bridgeScanning(bridgeState.state)&&
+      requestedBridgeRevision!==current&&r.bridgeRevision!==current)return load();
+   renderedBridgeRevision=r.bridgeRevision;
+ }
  if(scope==="owned"){
    updateLibrarySession(r);
    renderedLibraryRevision=r.libraryRevision;
@@ -415,7 +476,13 @@ async function load(refresh=false,web=null){
    }
  }}
 }
-function paint(){watchCovers.disconnect();const grid=$("#grid");grid.replaceChildren();items.forEach(a=>grid.append(card(a)));$("#empty").textContent=tr(items.length?"":"没有匹配的资产");}
+function paint(){
+ watchCovers.disconnect();const grid=$("#grid"),empty=$("#empty");grid.replaceChildren();items.forEach(a=>grid.append(card(a)));
+ empty.textContent=tr(items.length?"":"没有匹配的资产");
+ if(!items.length&&scope==="local"&&localSource==="bridge"&&!bridgeState?.path){
+   empty.replaceChildren(el("p",null,"导入后可在这里查找 Bridge 素材。"),button("导入 Bridge 资产",openBridgeLibrary));
+ }
+}
 function selection(a){if(!choices.has(a.uid)){const v=a.local[0];choices.set(a.uid,{k:v?.k||2,fmt:v?.fmt||(a.kind==="3d-model"?"FBX":"贴图")})}return choices.get(a.uid)}
 function preferredFile(files,selected){
  const candidates=files.filter(file=>file.fmt===selected.fmt);
@@ -508,7 +575,7 @@ function card(a){
  img.onerror=()=>{if(img.dataset.remote?.startsWith("https://")&&!img.dataset.remote.startsWith("https://covers.invalid/")&&img.src!==img.dataset.remote)img.src=img.dataset.remote;else noCover(img)};
  photo.append(img);
  img.onclick=()=>inspectAsset(a,img);
- if(selecting&&!a.discovery){
+ if(selecting&&!a.discovery&&!a.bridge){
    const pick=el("input","batch-pick");pick.type="checkbox";pick.checked=batchAssets.has(a.uid);pick.ariaLabel=tr("选择资产")+" "+a.title;
    pick.onchange=()=>{if(pick.checked)batchAssets.set(a.uid,a);else batchAssets.delete(a.uid);selectionTools()};photo.append(pick);
  }
@@ -527,6 +594,12 @@ function card(a){
  star.setAttribute("aria-pressed",String(a.favorite));star.title=tr(a.favorite?"取消收藏":"收藏");photo.append(star);
  const gear=button("⋯",()=>inspectAsset(a,img),"options");gear.title=gear.ariaLabel=tr("规格与导入选项");photo.append(gear);
  const title=el("div","name",a.title);title.title=a.title;body.append(title);
+ if(a.bridge){
+   const actions=el("div","actions");
+   actions.append(button(a.connected?"查看规格":"重新定位",a.connected?()=>inspectAsset(a,img):openBridgeLibrary,"primary"));
+   body.append(actions,el("small","texture-info",a.connected?"Bridge 资产":"Bridge 素材库未连接"));
+   return node;
+ }
  if(a.discovery){
    body.append(button("在 Fab 查看",()=>{
      if(hasFabBrowser)discover("https://www.fab.com/listings/"+a.uid);
@@ -604,14 +677,21 @@ function transferSummary(){
  bar.hidden=!active;if(active?.total)bar.value=100*active.done/active.total;else bar.removeAttribute("value");
 }
 $("#transfer").onclick=()=>showQueue(jobs.find(job=>job.state==="失败")?.id);
+$("#clearQueue").onclick=async()=>{
+ $("#clearQueue").disabled=true;
+ try{const r=await rpc("clearJobs");toast(r.message);await poll()}
+ catch(e){toast(e.message)}
+ finally{if(scope==="queue")paintJobs()}
+};
 function paintJobs(){const grid=$("#grid");grid.replaceChildren();$("#empty").textContent=tr(jobs.length?"":"队列为空");
+ $("#clearQueue").disabled=!jobs.some(j=>!j.active&&["完成","已取消","失败"].includes(j.state));
  let focused;
  for(const j of jobs){const row=el("div","queue");row.dataset.job=j.id;row.tabIndex=-1;
  if(j.id===queueTarget)focused=row;
  if(j.id===queueLocated)row.classList.add("located");
  row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;p.value=j.done;row.append(p);
  row.append(el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · ")));
- const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",!["完成","已取消"].includes(j.state)]]){
+ const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",!["完成","已取消"].includes(j.state)],["remove","移除",["完成","已取消","失败"].includes(j.state)&&!j.active]]){
  if(on)bar.append(button(label,async()=>{await rpc("control",{job:j.id,action});await poll()}))}
  row.append(bar);grid.append(row)}
  if(focused){
@@ -629,6 +709,8 @@ async function poll(){
  if(polling){pollAgain=true;return}clearTimeout(pollTimer);polling=true;
  try{
    jobs=await rpc("jobs");
+   const doneIds=new Set(jobs.filter(j=>j.state==="完成").map(j=>j.id));
+   for(const id of [...completed])if(!doneIds.has(id))completed.delete(id);
    transferSummary();
    for(const job of jobs){
      if(job.state!=="完成" || completed.has(job.id))continue;
@@ -654,7 +736,7 @@ async function poll(){
 }
 function saveView(){
  if(scope==="queue"||scope==="discover")return;
- try{localStorage.setItem("fab-view-v4",JSON.stringify({scope,kind,category,page,query:$("#query").value,zoom:$("#zoom").value,scroll:$("#scroll").scrollTop}))}catch{}
+ try{localStorage.setItem("fab-view-v4",JSON.stringify({scope,kind,category,localSource,page,query:$("#query").value,zoom:$("#zoom").value,scroll:$("#scroll").scrollTop}))}catch{}
 }
 let saveTimer;
 $("#scroll").onscroll=()=>{clearTimeout(saveTimer);saveTimer=setTimeout(saveView,180)};
@@ -691,14 +773,25 @@ $("#login").onclick=async()=>{
 };$("#add").onclick=async()=>{const r=await rpc("pick");if(r){toast(r);load()}};
 try{
  const v=JSON.parse(localStorage.getItem("fab-view-v4")||"null");
- if(v&&scopes[v.scope]&&v.scope!=="discover"&&v.scope!=="queue"){scope=v.scope;kind=v.kind;category=v.category||"";page=v.page||1;restoreScroll=v.scroll||0;$("#query").value=v.query||"";$("#zoom").value=v.zoom||230;$("#zoom").oninput({target:$("#zoom")})}
+ if(v&&scopes[v.scope]&&v.scope!=="discover"&&v.scope!=="queue"){
+   scope=v.scope;kind=v.kind;category=v.category||"";page=v.page||1;restoreScroll=v.scroll||0;
+   if(scope==="local"&&["all","fab","bridge","file"].includes(v.localSource))localSource=v.localSource;
+   $("#query").value=v.query||"";$("#zoom").value=v.zoom||230;$("#zoom").oninput({target:$("#zoom")});
+ }
 }catch{}
 bindFabBrowser();
+initBridgeLibrary();
 const narrowGallery=matchMedia("(max-width: 880px)");
 const syncCategories=()=>{$("#categoryGroup").open=!narrowGallery.matches};
 narrowGallery.addEventListener("change",syncCategories);syncCategories();
+let taxonomyPending=false, taxonomyLoaded=false;
+function loadTaxonomy(){
+ if(taxonomyPending||taxonomyLoaded)return;
+ taxonomyPending=true;
+ rpc("taxonomy").then(r=>{tree=r.tree;typeLabels=r.types;taxonomyLoaded=true;nav()})
+  .catch(e=>{if(scope==="owned")toast(e.message)}).finally(()=>{taxonomyPending=false});
+}
 load();poll();
-rpc("taxonomy").then(r=>{tree=r.tree;typeLabels=r.types;nav()}).catch(e=>toast(e.message));
 
 
 

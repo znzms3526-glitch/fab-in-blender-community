@@ -110,8 +110,19 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigatio
             if op=="viewListing"{guard let s=q["uid"] as? String,UUID(uuidString:s) != nil else{return};url+="listings/"+s}
             NSWorkspace.shared.open(URL(string:url)!);reply(["id":id,"result":""]);return
         }
-        if op=="pick"{
+        let chooseBridge=op=="bridgeScan" && (q["choose"] as? Bool)==true
+        if op=="bridgeScan"{q.removeValue(forKey:"path")}
+        if op=="pick" || chooseBridge{
             let panel=NSOpenPanel()
+            if chooseBridge{
+                panel.canChooseFiles=false
+                panel.canChooseDirectories=true
+                panel.message=q["caption"] as? String ?? "Choose the Quixel Bridge library folder"
+                let previous=q["directory"] as? String ?? ""
+                let initial=fm.fileExists(atPath:previous) ? URL(fileURLWithPath:previous,isDirectory:true) :
+                    fm.homeDirectoryForCurrentUser.appendingPathComponent("Documents/Megascans Library",isDirectory:true)
+                if fm.fileExists(atPath:initial.path){panel.directoryURL=initial}
+            }
             guard panel.runModal() == .OK,let path=panel.url?.path else{reply(["id":id,"result":""]);return}
             q["path"]=path
         }

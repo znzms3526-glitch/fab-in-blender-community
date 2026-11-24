@@ -5,15 +5,19 @@ import bpy
 import bmesh
 from mathutils import Vector, Quaternion
 from bpy_extras import view3d_utils
+from . import storage
 from .storage import MODELS
 
 
 def role(path):
     key = path.stem.lower()
+    tail = r"(?:$|[_ -](?:(?:[1248]|16)k|lod\d+)$)"
     for channel, pattern in (
         ("ORM", r"(?:^|[_ -])(orm|arm|occlusionroughnessmetallic)(?:$|[_ -])"),
-        ("Base Color", r"base.?colou?r|albedo|diffuse|_bc$"),
-        ("Normal", r"normal|_n$"), ("Roughness", r"roughness|_r$"), ("Metallic", r"metalness|metallic|_m$"),
+        ("Base Color", r"base.?colou?r|albedo|diffuse|(?:^|[_ -])(bc|col|color|diff)" + tail),
+        ("Normal", r"normal|(?:^|[_ -])(n|nrm|nor|norm)" + tail),
+        ("Roughness", r"roughness|(?:^|[_ -])(r|rough)" + tail),
+        ("Metallic", r"metalness|metallic|(?:^|[_ -])(m|metal|met)" + tail),
         ("Alpha", "opacity|alpha|cutout"), ("Height", "displacement|height|bump"),
     ):
         if re.search(pattern, key):
@@ -21,12 +25,34 @@ def role(path):
     return None
 
 
-def build_material(name, images, decal):
+def set_image_path(image, path, *, reload=False):
+    path = storage.normal_path(path)
+    if not bpy.data.filepath:
+        image.filepath = str(storage.fs_path(path))
+        if reload:
+            image.reload()
+        return
+    if storage.needs_extended_path(path) and not image.packed_file:
+        image.filepath = str(storage.fs_path(path))
+        if reload:
+            image.reload()
+        image.pack()
+        if not image.packed_file:
+            raise ValueError("无法打包超长路径的贴图")
+    project = storage.normal_path(Path(bpy.data.filepath).parent)
+    image.filepath = bpy.path.relpath(str(path), start=str(project)).replace("\\", "/")
+    if reload and not image.packed_file:
+        image.reload()
+
+
+def build_material(name, images, decal, *, prefer_first=False):
     maps = {}
     for p in images:
         key = role(p)
         if key:
             if key in maps:
+                if prefer_first:
+                    continue
                 raise ValueError("同一通道选择了多张贴图，请只选一档规格："+key)
             maps[key] = p
     if not maps and len(images) == 1:
@@ -42,8 +68,8 @@ def build_material(name, images, decal):
     for row, (key, p) in enumerate(maps.items()):
         tex = tree.nodes.new("ShaderNodeTexImage")
         tex.location = (-720, 300-row*290)
-        image = bpy.data.images.load(str(p), check_existing=True)
-        image.filepath = bpy.path.relpath(str(p)).replace(chr(92), "/")
+        image = bpy.data.images.load(str(storage.fs_path(p)), check_existing=True)
+        set_image_path(image, p)
         tex.image = image
         image.colorspace_settings.name = "sRGB" if key == "Base Color" else "Non-Color"
         output = tex.outputs["Color"]
@@ -94,15 +120,47 @@ def assign(obj, material):
         obj.data.materials.append(material)
 
 
-def import_files(context, paths, mode, name):
+def expected_texture_size(source):
+    sizes = source.get("textureSizes", [])
+    if sizes and sizes[0] and all(size == sizes[0] for size in sizes):
+        return tuple(sizes[0])
+    return None
+
+
+def material_texture_sizes(materials):
+    return {tuple(node.image.size) for mat in materials if mat and mat.node_tree
+            for node in mat.node_tree.nodes if node.type == "TEX_IMAGE" and node.image}
+
+
+def textures_match(materials, size):
+    return not size or material_texture_sizes(materials) == {tuple(size)}
+
+
+def require_texture_size(materials, size):
+    if not textures_match(materials, size):
+        raise ValueError("导入的贴图尺寸与所选规格不符")
+
+
+def import_files(context, paths, mode, name, *, texture_size=None):
     images = [p for p in paths if p.suffix.lower() not in MODELS]
     if mode == 1:
-        assign(context.active_object, build_material(name, images, False))
+        mat = build_material(name, images, False)
+        try:
+            require_texture_size([mat], texture_size)
+        except ValueError:
+            bpy.data.materials.remove(mat)
+            raise
+        assign(context.active_object, mat)
         return []
     if context.mode != "OBJECT":
         raise ValueError("放置模型或贴花前请切换到物体模式")
     if mode == 2:
         mat = build_material(name, images, True)
+        try:
+            require_texture_size([mat], texture_size)
+        except ValueError:
+            bpy.data.materials.remove(mat)
+            raise
         bpy.ops.mesh.primitive_plane_add(size=1)
         plane = context.active_object
         plane.name = name
@@ -111,28 +169,84 @@ def import_files(context, paths, mode, name):
     model = next(p for p in paths if p.suffix.lower() in MODELS)
     before = set(bpy.data.objects)
     prev_images = set(bpy.data.images)
+    if texture_size or images:
+        prev_meshes = set(bpy.data.meshes)
+        prev_materials = set(bpy.data.materials)
+    model_path = str(storage.fs_path(model))
     if model.suffix.lower() == ".glb":
-        bpy.ops.import_scene.gltf(filepath=str(model))
+        bpy.ops.import_scene.gltf(filepath=model_path)
     elif (5, 0, 0) <= bpy.app.version < (5, 3, 0):
         # The legacy importer writes CyclesLightSettings.cast_shadow, removed in 5.x.
-        bpy.ops.wm.fbx_import(filepath=str(model))
+        bpy.ops.wm.fbx_import(filepath=model_path)
     else:
-        bpy.ops.import_scene.fbx(filepath=str(model), use_image_search=False)
+        bpy.ops.import_scene.fbx(filepath=model_path, use_image_search=False)
     objs = sorted(set(bpy.data.objects)-before, key=lambda o:o.name)
     if not objs:
         raise ValueError("模型中没有可导入物体")
-    lookup = {p.name.lower():p for p in images}
-    for img in set(bpy.data.images)-prev_images:
-        p = lookup.get(Path(bpy.path.abspath(img.filepath)).name.lower())
-        if p and not img.packed_file:
-            img.filepath = bpy.path.relpath(str(p)).replace(chr(92), "/")
-            img.reload()
     meshes = [o for o in objs if o.type=="MESH"]
+    if images:
+        staged = {storage.resolved_path(path): path for path in images}
+        replacements = {}
+        private_materials = {}
+        for obj in meshes:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat in prev_materials:
+                    if mat not in private_materials:
+                        private_materials[mat] = mat.copy()
+                    slot.material = private_materials[mat]
+        bound_images = {node.image for obj in meshes for slot in obj.material_slots
+                        if (mat := slot.material) and mat.node_tree
+                        for node in mat.node_tree.nodes if node.type == "TEX_IMAGE" and node.image}
+        matches = {}
+        origins = {}
+        for img in bound_images:
+            current = storage.resolved_path(bpy.path.abspath(img.filepath)) if img.filepath else None
+            reference = current or img.name
+            path = staged.get(current) or storage.matching_texture(reference, staged)
+            if path is not None:
+                matches[img] = path
+                origins.setdefault(path, set()).add(reference)
+        for img, path in matches.items():
+            if len(origins[path]) > 1:
+                continue
+            if img.packed_file or img in prev_images:
+                other = bpy.data.images.load(str(storage.fs_path(path)), check_existing=False)
+                other.colorspace_settings.name = img.colorspace_settings.name
+                other.alpha_mode = img.alpha_mode
+                set_image_path(other, path)
+                replacements[img] = other
+            else:
+                set_image_path(img, path, reload=True)
+        if replacements:
+            mats = {slot.material for obj in meshes for slot in obj.material_slots if slot.material}
+            for mat in mats:
+                if mat.node_tree:
+                    for node in mat.node_tree.nodes:
+                        if node.type == "TEX_IMAGE" and node.image in replacements:
+                            node.image = replacements[node.image]
     original_materials={slot.material for obj in meshes for slot in obj.material_slots if slot.material}
-    if images and meshes and len(original_materials)<=1 and all(len(o.material_slots)<=1 for o in meshes):
-        mat = build_material(name, images, False)
+    channels = [key for path in images if (key := role(path))]
+    uses_original_maps = any(node.type == "TEX_IMAGE" and node.image and min(node.image.size) > 0
+                             for mat in original_materials if mat.node_tree for node in mat.node_tree.nodes)
+    can_replace = len(channels) == len(set(channels)) or not uses_original_maps
+    if images and meshes and can_replace and len(original_materials)<=1 and all(len(o.material_slots)<=1 for o in meshes):
+        mat = build_material(name, images, False, prefer_first=True)
         for obj in meshes:
             assign(obj, mat)
+    if texture_size:
+        materials = {slot.material for obj in meshes for slot in obj.material_slots}
+        try:
+            require_texture_size(materials, texture_size)
+        except ValueError:
+            for obj in objs:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            for blocks, previous in ((bpy.data.meshes, prev_meshes),
+                                     (bpy.data.materials, prev_materials), (bpy.data.images, prev_images)):
+                for block in set(blocks) - previous:
+                    if not block.users:
+                        blocks.remove(block)
+            raise
     return objs
 
 

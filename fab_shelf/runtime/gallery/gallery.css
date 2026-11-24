@@ -30,7 +30,8 @@ aside{overflow:hidden}
 #categoryGroup{flex:1 1 auto;min-height:0;overflow:auto;margin-top:12px;border-top:1px solid var(--line)}
 #categoryGroup>summary{padding:12px 10px;color:var(--muted);font-size:12px;cursor:pointer}
 .main-header{padding:12px 18px;gap:8px}
-.main-header h1{margin-right:auto}
+.header-title{display:flex;align-items:center;gap:10px;margin-right:auto;min-width:0}
+.main-header h1{margin-right:0}
 .main-header .search{margin-left:0}
 .main-header input[type=search]{width:clamp(80px,16vw,270px)}
 #transfer{flex:0 0 auto;gap:8px}
@@ -38,6 +39,40 @@ aside{overflow:hidden}
 #transfer progress{width:34px}
 #tools{padding:10px 18px}
 #tools>div{gap:8px;flex-wrap:wrap;justify-content:flex-end}
+main:has(> #localSources:not([hidden])){grid-template-rows:auto auto auto minmax(0,1fr) auto}
+main:has(> #localSources:not([hidden])):has(> #bridgeBanner:not([hidden])){grid-template-rows:auto auto auto auto minmax(0,1fr) auto}
+#localSources{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 18px 10px}
+#localSources button{white-space:nowrap}
+#localSources button[aria-pressed=true]{background:#293b33;color:#c4efda;border-color:#527767}
+#bridgeBanner{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 18px 10px;padding:9px 14px;border-radius:8px;border:1px solid #355046;background:#1d2824}
+#bridgeBanner p{margin:0;color:#cde4da;font-size:13px;line-height:1.45}
+#bridgeBanner .controls{flex:none;align-items:center}
+#bridgeBannerDismiss{padding:4px 9px;background:transparent;border-color:transparent;color:var(--muted)}
+#bridgeBannerDismiss:hover{background:#293b33;color:#e4e7eb}
+#bridgeSkippedDetails{font-size:12px;color:var(--muted)}
+#bridgeSkippedDetails summary{cursor:pointer;color:#b8ccc3}
+#bridgeSkippedList{max-height:160px;overflow:auto;margin:6px 0 0;padding-left:18px;display:grid;gap:4px}
+#bridgeSkippedList .name{display:inline;margin:0;white-space:normal;color:#dce2e7;font-weight:500}
+.danger{color:#f4b8b8;border-color:#774242;background:#362224}
+.danger:hover{background:#482b2e}
+.delete-confirm{margin:8px 0;padding:10px 12px;border-radius:8px;border:1px solid #6b3c3c;background:#2c1e20;display:grid;gap:8px}
+.delete-confirm p{margin:0;font-size:13px;color:#f3d2d2}
+.multi-model-hint{margin:6px 0 8px;padding:6px 9px;border-radius:6px;background:#232d29;border-left:2px solid var(--accent);font-size:12px;color:#c7dcd3;line-height:1.45}
+#bridgeLibrary{width:min(530px,92vw);max-height:88vh;overflow:auto;padding:0;color:inherit;background:#202328;border:1px solid var(--line);border-radius:12px}
+#bridgeLibrary::backdrop{background:#080a0bc9}
+#bridgeLibrary header{justify-content:space-between}
+#bridgeLibrary h2{margin:0;font-size:18px}
+.bridge-body{padding:16px;display:grid;gap:14px}
+.bridge-body p{margin:0;color:var(--muted);line-height:1.55}
+.bridge-body .controls{flex-wrap:wrap}
+.bridge-path{overflow-wrap:anywhere}
+.bridge-scan{display:grid;gap:8px}
+.bridge-scan progress{width:100%;height:12px;accent-color:var(--accent)}
+#bridgeSkipped{font-size:12px}
+#bridgeRemoveConfirm{display:grid;gap:8px}
+.inspect-body:has(>img[hidden]){grid-template-columns:minmax(0,1fr)}
+.bridge-specs .field{display:grid;gap:6px;margin:0 0 10px}
+.bridge-specs select{width:100%;min-width:0}
 .card .primary{min-width:68px}
 .batch-pick{inset:7px 43px auto auto;margin:3px 1px;z-index:1}
 .card .actions{margin-top:0;flex-wrap:wrap;gap:6px}
@@ -85,6 +120,8 @@ aside{overflow:hidden}
  .main-header{padding:8px 10px}
  .main-header h1{font-size:18px}
  #tools{padding:7px 10px}
+ #localSources{padding-inline:10px}
+ #bridgeBanner{margin:0 10px 8px;flex-wrap:wrap}
  #scroll{padding:0 10px 12px}
  .fab-bar{padding:6px 8px;gap:5px}
  .fab-bar button{padding-inline:6px}

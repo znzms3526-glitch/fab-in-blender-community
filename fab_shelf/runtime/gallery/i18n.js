@@ -2,6 +2,30 @@
 let uiLang=localStorage.getItem("fab-language")||"zh-CN";
 const phrases={
 "探索 Fab":"Explore Fab","我的 Fab 库":"My Fab Library","粘贴 Fab 链接":"Paste Fab link","Fab 商品链接":"Fab product link","定位资产":"Find asset",
+"导入 Bridge 资产":"Import Bridge assets","管理 Bridge 素材库":"Manage Bridge library","Bridge 资产":"Bridge assets",
+"素材来源":"Asset source","全部":"All","Fab 下载":"Fab downloads","本地文件":"Local files",
+"选择 Quixel Bridge 已下载的素材库文件夹。可在 Bridge 设置中查看素材库位置。登记时使用原位置的文件。":"Select the Quixel Bridge library folder. Find it in Bridge settings. The library uses your files in place.",
+"导入后可在这里查找 Bridge 素材。":"Find imported Bridge assets here.",
+"选择素材库":"Choose library folder","请选择 Bridge 素材库文件夹":"Choose the Quixel Bridge library folder",
+"重新扫描":"Rescan","重新定位":"Locate folder","移除登记":"Unregister","移除插件中的 Bridge 素材库登记？":"Unregister the Bridge library from the plugin?",
+"确认移除登记":"Unregister library","查看 Bridge 资产":"View Bridge assets","取消扫描":"Cancel scan","正在取消扫描…":"Cancelling scan…",
+"已取消扫描，保留上次登记":"Scan cancelled. The last index is available.","Bridge 扫描进度":"Bridge scan progress",
+"正在扫描 Bridge 素材库":"Scanning Bridge library","正在查找 Bridge 素材…":"Finding Bridge assets…",
+"已检查":"Checked","已识别":"Recognized","已登记 Bridge 资产":"Bridge assets registered",
+"缺少文件":"Missing files","格式暂不支持":"Unsupported format","无法读取":"Unreadable",
+"Bridge 素材库未连接":"Bridge library is disconnected","未找到可导入的 Bridge 资产":"No importable Bridge assets found. Choose the Bridge library folder.",
+"此目录与原 Bridge 素材库不匹配":"This folder does not match the registered Bridge library.",
+"另一个 Blender 窗口正在更新 Bridge 素材库":"Another Blender window is updating the Bridge library.",
+"Bridge 素材库已在另一个窗口更新，请重试":"Another Blender window updated the Bridge library. Try again.",
+"此 Bridge 规格已变化，请重新打开详情":"This Bridge variant changed. Reopen the asset details.",
+"Bridge 源文件已变化，请重新扫描":"Bridge source files changed. Rescan the library.",
+"模型格式与 LOD":"Model format and LOD","贴图分辨率":"Texture resolution","查看规格":"View variants",
+"导入 Blender":"Import into Blender","正在准备 Bridge 文件…":"Preparing Bridge files…",
+"导入的贴图尺寸与所选 Bridge 规格不符":"The imported textures do not match the selected Bridge size.",
+"导入的贴图尺寸与所选规格不符":"The imported textures do not match the selected size.",
+"无法读取 Bridge 素材库索引":"Could not read the Bridge library index.",
+"已校验的缓存文件已变化，请重试":"The verified cached file changed. Try again.",
+"包内贴图 ":"Textures in package: ",
 "首选贴图尺寸":"Preferred texture size","首选 ":"Preferred ","实际贴图 ":"Actual textures: ","已缓存贴图 ":"Cached textures: ","已读取 ":"Read: ",
 "Fab 所选格式未提供 ":"Selected Fab format does not contain ","Fab 未列出 ":"No Fab listing for ","Fab 标称 ":"Fab labelled ","K 的包实测尺寸不符":"K package has different texture dimensions",
 "批量核对已过期，请重新核对":"The batch check expired. Check again.",
@@ -49,9 +73,31 @@ const phrases={
 "无显式 HTTPS 代理":"No explicit HTTPS proxy","直连（应用层）":"Direct (application layer)","Fab 未提供该档位与格式组合。点齿轮查看此资产的实际文件。":"This format and resolution are unavailable. Open file options to see available files.",
 "请先登录 Fab":"Sign in to Fab first","请先登录":"Sign in first","Fab 响应格式异常，请稍后重试":"Invalid Fab response. Try again later.","Fab 响应超时，请刷新或登录":"Fab timed out. Refresh or sign in.","Fab 窗口已打开":"Fab library opened","请先保存 .blend；保存后将继续导入":"Save the .blend file to continue importing.",
 "已导入活动集合 · ":"Imported into active collection · ","材质已导入 · ":"Material imported · ","正在收集所选文件到项目目录":"Collecting selected files into the project folder","选择已改变。请在 Blender 的 Fab 面板确认导入目标。":"Selection changed. Confirm the import target in Blender's Fab panel.",
-"Fab 暂时未返回有效结果，正在重试":"Fab returned an invalid response. Retrying.","账号已变更，任务已暂停":"Account changed. Task paused.","Fab 登录验证已过期":"Fab session expired","请点击「登录 Fab」，完成后刷新个人库":"Sign in to Fab, then refresh your library."
+"Fab 暂时未返回有效结果，正在重试":"Fab returned an invalid response. Retrying.","账号已变更，任务已暂停":"Account changed. Task paused.","Fab 登录验证已过期":"Fab session expired","请点击「登录 Fab」，完成后刷新个人库":"Sign in to Fab, then refresh your library.",
+"清空已结束":"Clear finished","移除":"Remove","已移除任务记录":"Task removed","任务已不存在":"Task no longer exists","没有可清理的记录":"No finished tasks to clear","仅可移除已完成、已取消或失败的任务":"Only completed, canceled, or failed tasks can be removed.",
+"已清理 ":"Cleared "," 条记录":" items",
+"删除本地文件":"Delete local file","确认删除":"Confirm delete","返回":"Back","已删除本地缓存文件":"Local cached file deleted",
+"确认删除此本地缓存？仅删除本机文件，不影响 Epic 账号云端资产。":"Delete this local cached file? Only local files are removed; your Epic account library is unaffected.",
+"该资产正在下载中，请稍后再删除":"This asset is currently downloading. Try again later.","本地缓存文件不存在或已删除":"Local cached file no longer exists.","无效的本地资产标识":"Invalid local asset identifier.",
+"包内含 ":"Contains "," 个模型文件，已自动优先选择主模型；如需其他部件请在下方勾选切换。":" model files. The main model is pre-selected; check another below to switch parts.",
+"查看跳过明细":"View skipped details","格式暂不支持（如 UE UAsset）":"Unsupported format (e.g. UE UAsset)","缺少可用模型或贴图":"Missing importable models or textures",
+"已有 Quixel Bridge 本地素材库？支持原位置免拷贝登记，直接在 Blender 浏览与导入。":"Have a local Quixel Bridge library? Register it in place without copying files, and browse or import directly in Blender.",
+"不再提示":"Dismiss",
+"Fab 返回重复页码，已保存进度，请稍后继续":"Fab returned a repeated page. Your progress is saved. Resume later.",
+"此规格未返回下载地址":"Fab did not return a download URL for this variant.",
+"Fab 下载地址无效":"The Fab download URL is invalid.",
+"该规格已有导入任务，请在完成后重试":"An import for this variant is already queued. Try again after it finishes.",
+"无法打包超长路径的贴图":"Could not pack the texture from the long file path.",
+"文件正在由另一个 Blender 窗口使用，请稍后重试":"Another Blender window is using this file. Try again.",
+"另一个 Blender 窗口正在使用该任务，请稍后重试":"Another Blender window is using this task. Try again.",
+"任务文件正在使用，或没有删除权限，请稍后重试":"The task files are in use or cannot be removed. Try again.",
+"无法读取本地缓存索引，请稍后重试":"Could not read the local cache records. Try again.",
+"本地缓存文件正在使用，或没有删除权限，请稍后重试":"The cached file is in use or cannot be removed. Try again.",
+"本地缓存文件已删除，请重新下载":"The cached file was deleted. Download it again.",
+" · 有 ":" · "," 条任务暂无法移除，请稍后重试":" tasks could not be removed. Try again."
 };
-const fragments=Object.keys(phrases).filter(k=>k.length>1).sort((a,b)=>b.length-a.length);
+const exactLabels=new Set(["返回","移除","Fab 下载","本地文件"]);
+const fragments=Object.keys(phrases).filter(k=>k.length>1&&!exactLabels.has(k)).sort((a,b)=>b.length-a.length);
 const translationPattern=new RegExp(fragments.map(k=>k.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")).join("|"),"g");
 function tr(value){
  if(uiLang!=="en"||typeof value!=="string")return value;

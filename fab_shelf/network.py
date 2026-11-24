@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener, getproxies, proxy_bypass
 
-DEFAULTS=dict(language="zh-CN",apiRoute="system",fileRoute="system",proxy="",range="all",tier="personal",
+DEFAULTS=dict(language="zh-CN",apiRoute="system",fileRoute="system",proxy="",range="quixel",tier="personal",
               background=True,coverMiB=512)
 LABELS={"system":"跟随系统","direct":"直连","proxy":"指定代理"}
 

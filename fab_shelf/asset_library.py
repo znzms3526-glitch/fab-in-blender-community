@@ -156,13 +156,15 @@ def build(cache, request, output):
         bpy.data.objects.remove(obj, do_unlink=True)
     paths = storage.stage(cache, output.parent / "files", request, project_layout=False)
     source = request["source"].copy()
+    verified_size = scene.expected_texture_size(source)
     uid = source.get("uid")
     if uid:
         source["url"] = "https://www.fab.com/listings/" + str(uuid.UUID(uid))
+    origin = "Quixel Bridge · " + source["quixel_id"] if source.get("bridge") else source.get("url")
     title, label, spec = asset_labels(request)
     fmt = source.get("fmt", "")
     if request["mode"] == 0:
-        objects = scene.import_files(bpy.context, paths, 0, title)
+        objects = scene.import_files(bpy.context, paths, 0, title, texture_size=verified_size)
         if (not any(obj.type == "MESH" for obj in objects)
                 or any(obj.type not in {"MESH", "EMPTY"} or obj.animation_data for obj in objects)
                 or bpy.data.actions):
@@ -180,19 +182,20 @@ def build(cache, request, output):
     else:
         objects = []
         asset = scene.build_material(title, paths, False)
+        scene.require_texture_size([asset], verified_size)
 
     tag = json.dumps(source, ensure_ascii=True)
     for block in [*objects, *bpy.data.materials, asset]:
         block["fab_source"] = tag
-    members = {path.resolve(): name for path, name in zip(paths, request["files"])}
+    members = {storage.resolved_path(path): name for path, name in zip(paths, request["files"])}
     for image in bpy.data.images:
         if not image.users or image.source != "FILE" or image.packed_file:
             continue
-        location = Path(bpy.path.abspath(image.filepath)).resolve()
-        if location not in members or not location.is_file():
+        location = storage.resolved_path(bpy.path.abspath(image.filepath))
+        if location not in members or not storage.fs_path(location).is_file():
             raise ValueError("缺少可打包的贴图 · " + location.name)
         # Packing in an unsaved worker document needs an absolute source path.
-        image.filepath = str(location)
+        image.filepath = str(storage.fs_path(location))
         image.pack()
         if not image.packed_file:
             raise ValueError("无法打包贴图 · " + location.name)
@@ -202,10 +205,12 @@ def build(cache, request, output):
     asset.name = label
     asset.asset_mark()
     metadata = asset.asset_data
-    metadata.description = "\n".join(v for v in (source.get("url"), spec) if v)
-    for tag_name in dict.fromkeys(v for v in ("Fab", fmt, f'{source["k"]}K' if source.get("k") else "") if v):
+    metadata.description = "\n".join(v for v in (origin, spec) if v)
+    origin_tag = "Bridge" if source.get("bridge") else "Fab"
+    for tag_name in dict.fromkeys(v for v in (origin_tag, fmt, f'{source["k"]}K' if source.get("k") else "") if v):
         metadata.tags.new(tag_name)
-    key = hashlib.sha256((uid or request["hash"]).encode()).hexdigest()
+    preview_id = "bridge:" + source["quixel_id"] if source.get("bridge") else uid or request["hash"]
+    key = hashlib.sha256(preview_id.encode()).hexdigest()
     preview = cache / "previews" / (key + ".img")
     if preview.is_file():
         try:

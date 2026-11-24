@@ -81,6 +81,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
             dest.parent.mkdir(exist_ok=True)
             dest.write_bytes(data)
             rec = dict(asset, hash=digest, name=name, file=file_id, format="fbx", bytes=len(data))
+            catalog.save_package_record(app.cache, rec)
             app.record_local(rec)
             return rec
 

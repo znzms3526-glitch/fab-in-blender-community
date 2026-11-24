@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Fab in Blender · Fab 资产库",
     "author": "Fab Shelf",
-    "version": (0, 11, 6),
+    "version": (0, 12, 0),
     "blender": (4, 1, 1),
     "location": "3D 视图 > N 面板 > Fab",
     "description": "在副屏浏览 Fab，下载资产并导入工程或 Blender 资产库",
@@ -21,7 +21,7 @@ import threading
 import bpy
 from bpy.app.handlers import persistent
 
-from . import scene, storage, gallery, project_assets, webview_runtime, asset_library
+from . import scene, storage, gallery, project_assets, webview_runtime, asset_library, bridge
 
 _session = {}
 _task = None
@@ -235,17 +235,8 @@ class FAB_OT_import(bpy.types.Operator):
                 note(f"已更新 {count} 个贴图节点")
                 return {"FINISHED"}
             if request.get("action")=="repair":
-                by_member=dict(zip(request["files"],_task["paths"]))
-                for img in bpy.data.images:
-                    if img.library or img.packed_file or img.name not in request.get("target",[]):continue
-                    src=project_assets.reference(img)
-                    path=by_member.get(img.get("fab_member"))
-                    if src.get("hash")==request["hash"] and path:
-                        img.filepath=bpy.path.relpath(str(path))
-                        img.reload()
-                    elif Path(bpy.path.abspath(img.filepath)).resolve() in _task["paths"]:
-                        img.reload()
-                note("已恢复工程贴图 · "+request["name"])
+                count=project_assets.repair_download(request,_task["paths"])
+                note(f"已恢复 {count} 张工程贴图 · {request['name']}")
                 return {"FINISHED"}
             objs = project_assets.place(context,_task["paths"],request)
             if objs:
@@ -418,16 +409,31 @@ class FAB_OT_repair(bpy.types.Operator):
             return {"CANCELLED"}
         cache=Path(prefs(context).cache)
         self.packages.clear()
+        checked = {}
         for img,src,member in project_assets.missing_images(cache):
             row=self.packages.add()
             row.digest=src["hash"]
-            row.online=not (project_assets.project_file(src,member).is_file() or (cache/"packages"/row.digest).is_file())
+            row.name=img.name
+            if src.get("bridge"):
+                try:
+                    if project_assets.project_copy(src, member):
+                        row.available = row.selected = True
+                        row.label = img.name + " · 本地可修复"
+                        continue
+                    bridge.source_files(cache, src, [member])
+                except (OSError, ValueError, KeyError) as error:
+                    row.label = img.name + " · " + str(error)
+                else:
+                    row.available = row.selected = True
+                    row.label = img.name + " · Bridge 源文件可修复"
+                continue
+            row.online=not (project_assets.project_copy(src,member)
+                            or project_assets.has_package(cache,src,checked))
             row.available=not row.online or bool(src.get("uid") and src.get("file"))
             row.selected=not row.online
             size=src.get("bytes",0)
             route=(f"下载整包 {size/1048576:.1f} MiB" if size else "下载整包 · 大小未知") if row.available else "缺少来源"
             row.label=img.name+" · "+(route if row.online else "本地可修复")
-            row.name=img.name
         if not self.packages:
             self.report({"INFO"},"未发现缺失或损坏的 Fab 贴图")
             return {"FINISHED"}
@@ -443,9 +449,12 @@ class FAB_OT_repair(bpy.types.Operator):
         cache=Path(prefs(context).cache)
         selected={item.name for item in self.packages if item.selected and item.available}
         pending={}
+        checked = {}
         for img,src,member in list(project_assets.missing_images(cache)):
             if img.name not in selected:continue
-            if project_assets.project_file(src,member).is_file() or (cache/"packages"/src["hash"]).is_file():continue
+            if src.get("bridge"):continue
+            if (project_assets.project_copy(src,member)
+                    or project_assets.has_package(cache,src,checked)):continue
             req=pending.setdefault(src["hash"],dict(uid=src["uid"],source=src,file=src["file"],k=src.get("k",0),action="repair",files=[],target=[],**{"import":True}))
             if member not in req["files"]:req["files"].append(member)
             req["target"].append(img.name)

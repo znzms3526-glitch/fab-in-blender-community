@@ -5,13 +5,31 @@ import sys
 from pathlib import Path
 
 
-def lock_file(file):
+def lock_file(file, *, shared=False):
     if os.name=="nt":
         import msvcrt
-        msvcrt.locking(file.fileno(),msvcrt.LK_NBLCK,1)
+        if shared:
+            import ctypes
+            from ctypes import wintypes
+
+            class Overlapped(ctypes.Structure):
+                _fields_ = [("internal", ctypes.c_size_t), ("internal_high", ctypes.c_size_t),
+                            ("offset", wintypes.DWORD), ("offset_high", wintypes.DWORD),
+                            ("event", wintypes.HANDLE)]
+
+            lock = ctypes.WinDLL("kernel32", use_last_error=True).LockFileEx
+            lock.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                             wintypes.DWORD, ctypes.POINTER(Overlapped)]
+            lock.restype = wintypes.BOOL
+            fail_immediately = 1
+            if not lock(msvcrt.get_osfhandle(file.fileno()), fail_immediately, 0, 1, 0,
+                        ctypes.byref(Overlapped())):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            msvcrt.locking(file.fileno(),msvcrt.LK_NBLCK,1)
     else:
         import fcntl
-        fcntl.flock(file,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        fcntl.flock(file,(fcntl.LOCK_SH if shared else fcntl.LOCK_EX)|fcntl.LOCK_NB)
 
 
 def host_command(role,*args):
