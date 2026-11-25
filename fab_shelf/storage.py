@@ -63,11 +63,27 @@ def staged_path(base, digest, member, *, project_layout=True):
     return dest
 
 
-def legacy_compact_path(base, digest, member):
-    rel = safe_member(member)
+def _compact_name(rel):
     token = hashlib.sha256(rel.as_posix().encode("utf8")).hexdigest()[:8]
     stem = rel.stem[-48:].strip(" .") or "asset"
-    return Path(base) / "Assets" / "Fab" / digest[:16] / f"{token}_{stem}{rel.suffix}"
+    return f"{token}_{stem}{rel.suffix}"
+
+
+def legacy_compact_path(base, digest, member):
+    return Path(base) / "Assets" / "Fab" / digest[:16] / _compact_name(safe_member(member))
+
+
+def asset_path(root, digest, member, *, compact=False):
+    """Resolve a managed member beneath an explicit project asset directory."""
+    rel = safe_member(member)
+    root = resolved_path(root)
+    if compact:
+        dest = root / digest[:16] / _compact_name(rel)
+    else:
+        dest = root / digest / rel
+    if not resolved_path(dest).is_relative_to(root):
+        raise ValueError("文件路径超出工程素材目录")
+    return dest
 
 
 def texture_variant_key(path):
@@ -264,7 +280,7 @@ def member_checks(cache,source):
     return {source["name"]:(blob.stat().st_size,source["hash"])}
 
 
-def stage(cache, project, request, *, project_layout=True):
+def stage(cache, project, request, *, project_layout=True, asset_root=None, compact=False, checks=None):
     digest = request["hash"]
     if not re.fullmatch("[a-f0-9]{64}", digest):
         raise ValueError("缓存记录无效")
@@ -298,7 +314,8 @@ def stage(cache, project, request, *, project_layout=True):
             raise ValueError("文件与缓存记录不匹配")
         outputs = []
         for name in names:
-            dest = staged_path(root, digest, name, project_layout=project_layout)
+            dest = (staged_path(root, digest, name, project_layout=project_layout) if asset_root is None
+                    else asset_path(asset_root, digest, name, compact=compact))
             dest_fs = fs_path(dest)
             if from_bridge:
                 expected, checksum = source["bridge"]["checks"][name]
@@ -335,6 +352,8 @@ def stage(cache, project, request, *, project_layout=True):
                     os.replace(tmp, dest_fs)
                 finally:
                     tmp.unlink(missing_ok=True)
+            if checks is not None:
+                checks[name] = (expected, checksum)
             outputs.append(dest)
         return outputs
 

@@ -8,6 +8,13 @@ from contextlib import closing
 from pathlib import Path
 
 
+def retry_after_seconds(error):
+    if "HTTP 429" not in str(error):
+        return None
+    hint = re.search(r"retry=(\d+)", str(error))
+    return max(1, int(hint[1])) if hint else 60
+
+
 class FreeTask:
     def __init__(self, gallery):
         self.gallery=gallery
@@ -26,6 +33,13 @@ class FreeTask:
         with closing(sqlite3.connect(path)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS items(uid TEXT PRIMARY KEY, title TEXT, status TEXT)")
             db.execute("CREATE INDEX IF NOT EXISTS items_status ON items(status)")
+            # Keep old clients' three-column INSERTs valid when they share this download library.
+            db.execute("CREATE TABLE IF NOT EXISTS item_reasons(uid TEXT PRIMARY KEY, reason TEXT NOT NULL)")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS remove_resolved_item_reason
+                       AFTER UPDATE OF status ON items WHEN OLD.status='manual' AND NEW.status<>'manual'
+                       BEGIN DELETE FROM item_reasons WHERE uid=OLD.uid; END""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS remove_deleted_item_reason AFTER DELETE ON items
+                       BEGIN DELETE FROM item_reasons WHERE uid=OLD.uid; END""")
             db.execute("CREATE TABLE IF NOT EXISTS checkpoint(id INTEGER PRIMARY KEY, cursor TEXT, finished INTEGER)")
             db.execute("INSERT OR IGNORE INTO checkpoint VALUES(1,'',0)")
             db.commit()
@@ -39,18 +53,22 @@ class FreeTask:
         if path:
             with closing(sqlite3.connect(path)) as db:
                 counts=dict(db.execute("SELECT status,count(*) FROM items GROUP BY status"))
-                manual=[dict(uid=row[0],title=row[1]) for row in db.execute("SELECT uid,title FROM items WHERE status IN ('manual','retry','verify') ORDER BY rowid DESC LIMIT 12")]
+                manual = [dict(uid=uid, title=title, status=status, reason=reason or "")
+                          for uid, title, status, reason in db.execute(
+                              """SELECT items.uid, title, status, reason FROM items
+                                 LEFT JOIN item_reasons ON items.uid=item_reasons.uid AND status='manual'
+                                 WHERE status IN ('manual','retry','verify') ORDER BY items.rowid DESC LIMIT 12""")]
                 finished=bool(db.execute("SELECT finished FROM checkpoint").fetchone()[0])
         return dict(self.info,running=self.running,counts=counts,finished=finished,manual=manual)
 
-    def start(self,account,scope,tier,retry_only=False):
+    def start(self,account,scope,tier,retry_only=False,library_revision=None):
         with self.lock:
             if self.running:return self.status()
             self.path=self.inspect(account,scope,tier)
             self.info=dict(account=account["name"],scope=scope,tier=tier,message="")
             self.pause.clear()
             self.running=True
-            self.gallery.pool.submit(self.run,account["uid"],scope,tier,self.path,retry_only)
+            self.gallery.pool.submit(self.run,account["uid"],scope,tier,self.path,retry_only,library_revision)
         return self.status()
 
     def request(self, **q):
@@ -70,9 +88,8 @@ class FreeTask:
 
 
     def back_off(self,exc):
-        if "HTTP 429" not in str(exc):raise exc
-        hint=re.search(r"retry=(\d+)",str(exc))
-        delay=max(1,int(hint[1])) if hint else 60
+        delay=retry_after_seconds(exc)
+        if delay is None:raise exc
         self.info["retryAt"]=int(time.time())+delay
         self.info["message"]=f"Fab 限流，{delay} 秒后继续"
         self.pause.wait(delay)
@@ -118,9 +135,11 @@ class FreeTask:
             if any(msg in message for msg in ("响应格式异常","HTTP 404","HTTP 400")):return next_status
             raise ValueError(message)
         if status not in {"added","confirmed","manual","verify"}:raise ValueError("Fab 结果未知")
+        if status=="manual" and result.get("reason") in {"bundle","terms","no_free_offer"}:
+            db.execute("INSERT OR REPLACE INTO item_reasons(uid,reason) VALUES(?,?)",(uid,result["reason"]))
         return status
 
-    def run(self,account,scope,tier,path,retry_only=False):
+    def run(self,account,scope,tier,path,retry_only=False,library_revision=None):
         from .desktop import lock_file
         lockfile=path.with_suffix(".lock").open("a+b")
         try:
@@ -164,6 +183,8 @@ class FreeTask:
                                 db.executemany("UPDATE items SET status=? WHERE uid=?",
                                                [("confirmed" if uid in recovering else "owned",uid) for uid in owned])
                                 db.commit()
+                                if reconciled := owned & recovering:
+                                    self.gallery.mark_library_dirty(account,reconciled,library_revision)
                                 # Little overlap: use the ordinary pre-submit check until the next page.
                                 batch_reads=bool(owned or available)
                             for uid in rows:
@@ -180,7 +201,7 @@ class FreeTask:
                                 if consecutive_retries>=24:
                                     raise ValueError("连续 24 项无法核实，扫描已暂停。请在 Fab 官网检查登录和资产状态后继续。")
                                 if status in {"added","confirmed"}:
-                                    self.gallery.page_cache.clear();self.gallery.facets.clear()
+                                    self.gallery.mark_library_dirty(account,(uid,),library_revision)
                                     if status=="added":self.next_submit=time.monotonic()+.8
                         except ValueError as exc:
                             self.back_off(exc)

@@ -1,4 +1,5 @@
 """Free-library checkpoints and per-account isolation, without live account writes."""
+import hashlib
 import tempfile
 import sqlite3
 from contextlib import closing
@@ -12,7 +13,9 @@ sys.path.insert(0,str(Path(__file__).parent))
 from fab_shelf.free_task import FreeTask
 with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td, ThreadPoolExecutor(1) as pool:
     calls=[]
-    stub=SimpleNamespace(cache=Path(td),pool=pool,stop=Event(),page_cache={},facets={})
+    changes=[]
+    stub=SimpleNamespace(cache=Path(td),pool=pool,stop=Event(),
+                         mark_library_dirty=lambda uid,items,revision:changes.append((uid,set(items),revision)))
     task=FreeTask(stub)
     attempts=[]
     glitches=[]
@@ -142,12 +145,46 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td, ThreadPoolExe
     assert sorted(submitted)==sorted(ids[1:]) and individual==["legacy","slow","separate"]
     assert 3 in waits and task.status()["counts"]=={"verify":2,"added":4}
     def reconcile_only(q):
-        if q["op"]=="ownedBatch":return {"owned":[],"available":q["uids"]}
+        if q["op"]=="ownedBatch":return {"owned":q["uids"]}
         assert q["op"]=="checkFree"
         return {"status":"owned"}
     stub.api=reconcile_only
     task.start(me,"all","professional",True);wait()
     assert task.status()["counts"]=={"confirmed":2,"added":4}
+    assert all(uid==me["uid"] for uid,_,_ in changes)
+    assert (me["uid"],{"legacy","lost"},None) in changes
+
+    legacy=dict(uid="legacy-account",name="Legacy")
+    key=hashlib.sha256((legacy["uid"]+"quixel"+"personal").encode()).hexdigest()
+    old_path=Path(td)/"free-tasks"/(key+".db")
+    with closing(sqlite3.connect(old_path)) as db:
+        db.execute("CREATE TABLE items(uid TEXT PRIMARY KEY, title TEXT, status TEXT)")
+        db.execute("INSERT INTO items VALUES('legacy','Legacy listing','manual')")
+        db.commit()
+    task=FreeTask(stub)
+    assert task.inspect(legacy,"quixel","personal")==old_path
+    assert task.status(old_path)["manual"]==[dict(uid="legacy",title="Legacy listing",status="manual",reason="")]
+    with closing(sqlite3.connect(old_path)) as db:
+        # A client that still uses 0.12.1's INSERT can keep writing after inspection.
+        db.execute("INSERT INTO items VALUES('older-client','Older client listing','owned')")
+        db.commit()
+
+    def manual_reason(q):
+        if q["op"]=="freePage":
+            return dict(items=[dict(uid="new-manual",title="New listing")],next="")
+        if q["op"]=="checkFree":return dict(status="available")
+        assert q["op"]=="submitFree"
+        return dict(status="manual",reason="terms")
+
+    stub.api=manual_reason
+    task.start(legacy,"quixel","personal");wait()
+    assert task.status()["counts"]==dict(manual=2,owned=1)
+    assert task.status()["manual"][0]==dict(uid="new-manual",title="New listing",status="manual",reason="terms")
+    with closing(sqlite3.connect(old_path)) as db:
+        db.execute("UPDATE items SET status='retry' WHERE uid='new-manual'")
+        db.commit()
+        assert not db.execute("SELECT 1 FROM item_reasons WHERE uid='new-manual'").fetchone()
+    assert task.status()["manual"][0]["reason"]==""
 print("PASS: pause, fresh-session resume, account isolation, duplicate suppression, verified counts")
 
 

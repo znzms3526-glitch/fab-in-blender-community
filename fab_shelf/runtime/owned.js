@@ -158,18 +158,18 @@ async function fabRequest(q) {
     try{
       if(q.recheckOwnership && current!==false)return {status:current===true?"owned":"retry"};
       const [d,p]=await Promise.all([get(base),get(base+"/prices-infos","no-store")]);
-      if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle")return {status:"manual"};
+      if((d.listingType?.code||d.listingType)==="bundle" || (d.productType?.code||d.productType)==="bundle")return {status:"manual",reason:"bundle"};
       const licenses=Array.isArray(d.licenses)?d.licenses:[];
       const l=licenses.find(l=>l.slug===q.tier)||licenses.find(l=>l.isCc0||l.isCc);
       const offer=p.offers?.find(o=>o.offerId===l?.offerId);
-      if(!offer||!l?.offerId)return {status:"manual"};
-      if(!acceptsBuyerTerms(me,l))return {status:"manual"};
-      if(typeof offer.price!=="number" || offer.price!==0)return {status:"manual"};
-      if(offer.discountedPrice!=null && offer.discountedPrice!==0)return {status:"manual"};
+      if(!offer||!l?.offerId||offer.price!==0||(offer.discountedPrice!=null&&offer.discountedPrice!==0)){
+        return {status:"manual",reason:"no_free_offer"};
+      }
+      if(!acceptsBuyerTerms(me,l))return {status:"manual",reason:"terms"};
       const token=()=>document.cookie.split(";").map(c=>c.trim()).find(c=>c.startsWith("fab_csrftoken="))?.slice(14);
       if(!token())await fetch("/i/csrf",{credentials:"same-origin"});
       if(!token())throw Error("Fab 登录验证已过期");
-      if(!acceptsBuyerTerms(await claimAccount(),l))return {status:"manual"};
+      if(!acceptsBuyerTerms(await claimAccount(),l))return {status:"manual",reason:"terms"};
       offerId=l.offerId;
       csrf=decodeURIComponent(token()||"");
       if(!csrf)throw Error("Fab 登录验证已过期");

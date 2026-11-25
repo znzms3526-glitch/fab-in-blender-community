@@ -40,7 +40,14 @@ def set_image_path(image, path, *, reload=False):
         if not image.packed_file:
             raise ValueError("无法打包超长路径的贴图")
     project = storage.normal_path(Path(bpy.data.filepath).parent)
-    image.filepath = bpy.path.relpath(str(path), start=str(project)).replace("\\", "/")
+    try:
+        reference = bpy.path.relpath(str(path), start=str(project))
+    except ValueError:
+        # Blender cannot create a relative path between Windows volumes.
+        # Keep UNC backslashes so Blender does not interpret the `//` prefix as relative.
+        image.filepath = str(path) if path.drive.startswith("\\\\") else path.as_posix()
+    else:
+        image.filepath = reference.replace("\\", "/")
     if reload and not image.packed_file:
         image.reload()
 

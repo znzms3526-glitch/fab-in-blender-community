@@ -17,8 +17,20 @@ function fields(s,tab){
  if(!tab||tab==="界面")$("#language").value=s.language||"zh-CN";
  if(!tab||tab==="网络"){for(const k of ["apiRoute","fileRoute","proxy"])$("#"+k).value=s[k];}
  if(!tab||tab==="入库"){$("#prefRange").value=s.range;$("#prefTier").value=s.tier;$("#background").checked=s.background}
- if(!tab||tab==="存储"){$("#coverMiB").value=s.coverMiB;$("#libraryDir").value=prefState.nextCache||prefState.cache}
+ if(!tab||tab==="存储"){$("#coverMiB").value=s.coverMiB;$("#libraryDir").value=prefState.cache}
 }
+function cacheSwitchPending(){return !!(prefState?.nextCache||prefState?.cacheSwitching)}
+function paintCacheSwitch(){
+ const status=$("#libraryDirStatus"), pending=prefState.nextCache;
+ status.hidden=!pending;
+ status.textContent=pending?tr("待切换目录 · ")+pending+" · "+tr("现有任务完成后自动切换下载库"):"";
+ $("#libraryDir").disabled=$("#prefReset").disabled=$("#prefSave").disabled=cacheSwitchPending();
+}
+chrome.webview.addEventListener("message",({data})=>{
+ if(data.cacheChange&&prefState&&$("#preferences").open){
+   Object.assign(prefState,data.cacheChange);$("#libraryDir").value=prefState.cache;paintCacheSwitch();
+ }
+});
 function renderMeasurement(r){
  measured=r;$("#measure").replaceChildren();$("#recommend").hidden=!r||!(r.api||r.files);
  if(!r)return;
@@ -27,13 +39,14 @@ function renderMeasurement(r){
 }
 function paintPrefs(r){
  prefState=r;fields(r.values);$("#detected").textContent=tr("系统显式 HTTPS 代理："+(r.systemProxy||"未检测到"));
+ paintCacheSwitch();
  $("#effective").textContent=tr("当前接口："+r.apiLabel+"　文件："+r.fileLabel);
  $("#diag").textContent=tr(["Fab in Blender "+r.version,"账号连接："+r.connection,"接口："+r.apiLabel,"文件："+r.fileLabel,"最近异常："+(r.lastError||"无"),"入库状态："+r.taskState].join("\n"));
  probeProxy=r.lastTest?.proxy??r.values.proxy;renderMeasurement(r.lastTest);
 }
 $("#prefs").onclick=async()=>{
  $("#preferences").showModal();$("#prefMsg").textContent=tr("正在读取…");$("#prefSave").disabled=true;
- try{paintPrefs(await rpc("settings"));selectTab(prefTab);$("#prefMsg").textContent=tr("");$("#prefSave").disabled=false}catch(e){$("#prefMsg").textContent=tr(e.message)}
+ try{paintPrefs(await rpc("settings"));selectTab(prefTab);$("#prefMsg").textContent=""}catch(e){$("#prefMsg").textContent=tr(e.message)}
 };
 $("#prefClose").onclick=()=>$("#preferences").close();
 $("#prefReset").onclick=()=>{fields(prefState.defaults,prefTab);if(prefTab==="存储")$("#libraryDir").value=prefState.defaultCache;$("#prefMsg").textContent=tr("点击保存应用默认值")};
@@ -50,13 +63,14 @@ $("#prefSave").onclick=async()=>{
  try{
    const old= prefState.values;
    paintPrefs(await rpc("saveSettings",{values,cache:$("#libraryDir").value}));
+   if(cacheSwitchPending()){$("#prefMsg").textContent=tr("现有任务完成后自动切换下载库");return}
    if(hasFabBrowser && scope==="discover" && (old.apiRoute!==values.apiRoute || (values.apiRoute==="proxy" && old.proxy!==values.proxy))){
      clearFabCheck();await openFabPage();
    }
    applyLanguage(values.language);
    $("#range").value=values.range;$("#license").value=values.tier;$("#prefMsg").textContent=tr("设置已保存");
  }
- catch(e){$("#prefMsg").textContent=tr(e.message)}finally{$("#prefSave").disabled=false}
+ catch(e){$("#prefMsg").textContent=tr(e.message)}finally{$("#prefSave").disabled=cacheSwitchPending()}
 };
 rpc("settings").then(r=>{applyLanguage(r.values.language);if(!$("#claim").open){$("#range").value=r.values.range;$("#license").value=r.values.tier}});
 

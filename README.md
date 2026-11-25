@@ -10,12 +10,12 @@ Browse Fab from a separate Blender companion window, claim free assets on Fab, o
 
 ## 第一次导入
 
-1. 在发布页的 **Assets** 下下载 **Fab-in-Blender-Windows.zip**。保留 ZIP 压缩格式。
+1. 在发布页的 **Assets** 下下载 Windows x64 安装包。保留 ZIP 压缩格式。
 2. 打开 Blender 首选项，在插件菜单选择 **从磁盘安装 / Install from Disk**，选中 ZIP 并启用 **Fab in Blender**。更新已有版本后重启 Blender。
 3. 先保存当前 `.blend`。在 3D 视图按 **N → Fab → 打开我的 Fab 库**，从资产库的「账号」菜单登录。首次打开时，缺少 WebView2 的 Windows 电脑需要联网安装这个组件。
 4. 在「我的库」选择一件资产。选好档位和格式，点「下载」。已有对应文件时，直接点卡片上的「导入」。模型会出现在活动集合的 3D 游标位置。
 
-**Quick start in English.** Download **Fab-in-Blender-Windows.zip** under Releases → Assets, install it from disk in Blender Preferences, and enable the add-on. Save your scene, then open the library from the 3D Viewport sidebar under **Fab**. Sign in, choose a file format and resolution, download, and click **Import**. Change the gallery language under **设置 → 界面 → 界面语言 → English**.
+**Quick start in English.** Download the Windows x64 ZIP under Releases → Assets, install it from disk in Blender Preferences, and enable the add-on. Save your scene and open the library from the 3D Viewport sidebar under **Fab**. Sign in, choose a file format and resolution, download, and click **Import**. Change the gallery language under **设置 → 界面 → 界面语言 → English**.
 
 ## 搭场景时可以怎样用
 
@@ -29,7 +29,8 @@ Browse Fab from a separate Blender companion window, claim free assets on Fab, o
 | 清理下载队列或释放本地磁盘空间 | 在「下载队列」可逐条「移除」或点「清空已结束」；在资产详情「⋯」可二次确认后「删除本地文件」（不影响云端账号资产）。 |
 | 把同一个道具摆在多个位置 | 再点「导入」。支持复用的静态单网格模型共享网格和材质，每个物体都能单独移动。齿轮菜单可以创建独立副本。 |
 | 渲染前提高贴图分辨率 | 选中物体，在 **N → Fab → Fab 来源** 切换贴图规格。默认只更新当前物体，也可选择共用材质的物体一起更新。 |
-| 移动工程或找回贴图 | 项目文件保存在 `.blend` 同级的 `Assets/Fab`。移动时带上这个目录；遇到缺图可在 Fab 面板点「检查并修复缺失贴图」。 |
+| 更改下载和导入的位置 | **N → Fab** 显示两处路径。**Fab 下载库**存原始包。**当前工程素材目录**存导入时解包的模型和贴图，默认在 `.blend` 同级的 `Assets/Fab`，也可以指定目录。 |
+| 移动工程或找回贴图 | 将 `.blend` 和当前工程素材目录一起移动。需要接回文件时，在 **N → Fab → 检查并修复 Fab 贴图** 选择**重新定位素材目录**。 |
 
 ## 兼容范围
 

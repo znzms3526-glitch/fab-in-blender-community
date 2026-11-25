@@ -429,7 +429,7 @@ async function watchLibrarySession(){
  watchingLibrary=true;
  try{
    const session=await rpc("librarySession");
-   if(scope!=="owned"||document.hidden)return;
+   if(scope!=="owned"||document.hidden||session.automaticDeferred)return;
    const changed=updateLibrarySession(session);
    if(changed)page=1;
    const stale=renderedLibraryRevision!==libraryRevision||renderedLibraryContentRevision!==libraryContentRevision;
@@ -711,9 +711,16 @@ function paintJobs(){const grid=$("#grid");grid.replaceChildren();$("#empty").te
  if(j.id===queueTarget)focused=row;
  if(j.id===queueLocated)row.classList.add("located");
  row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;p.value=j.done;row.append(p);
- row.append(el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · ")));
+ const status=el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · "));
+ if(j.directory)status.append(" · "+j.directory);
+ row.append(status);
  const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",!["完成","已取消"].includes(j.state)],["remove","移除",["完成","已取消","失败"].includes(j.state)&&!j.active]]){
  if(on)bar.append(button(label,async()=>{await rpc("control",{job:j.id,action});await poll()}))}
+ if(j.directory){
+   const folder=button("打开下载目录",async()=>{try{await rpc("openDownloadFolder")}catch(e){toast(e.message)}});
+   folder.title=j.directory;
+   bar.append(folder);
+ }
  row.append(bar);grid.append(row)}
  if(focused){
    queueTarget="";
@@ -833,21 +840,33 @@ grip.onkeydown=e=>{if(["ArrowLeft","ArrowRight"].includes(e.key)){width(+grip.ge
 grip.ondblclick=()=>width(250);
 $("#openFab").onclick=()=>rpc("openFab");
 let claimIdentity="",claimRunning=false,claimTimer,claimToken=0;
+const claimReasons={
+ bundle:"需处理合集",
+ terms:"需确认适用条款",
+ no_free_offer:"当前许可无可直接领取的零元报价"
+};
 function showClaim(r){
+ const finished=claimRunning&&!r.running;
  claimRunning=r.running;const c=r.counts||{};
  if(r.identity)claimIdentity=r.identity;
  $("#account").textContent=tr("当前账号 · "+(r.account||""));
- $("#claimCounts").textContent=tr("新增 "+(c.added||0)+"　已拥有 "+(c.owned||0)+"　已核验拥有 "+(c.confirmed||0)+"　待核验 "+(c.verify||0)+"　待重试 "+(c.retry||0)+"　待官网处理 "+(c.manual||0)+"　待扫描处理 "+(c.pending||0));
+ $("#claimCounts").textContent=tr("新增 "+(c.added||0)+"　已拥有 "+(c.owned||0)+"　已核验拥有 "+(c.confirmed||0)+"　待核验 "+(c.verify||0)+"　待重试 "+(c.retry||0)+"　需到 Fab 手动处理 "+(c.manual||0)+"　已发现，待核对 "+(c.pending||0));
  $("#claimNote").textContent=tr(r.message||(r.running?"正在后台处理，关闭面板后继续。":(c.retry||c.verify)?"所有权未确认的资产可在官网核对。点击“仅重试异常项”可重新检查，已提交的条目只核验结果。":r.finished?"本轮扫描完成。":""));
  const details=$("#manualLinks"), links=details.querySelector("div");
  details.hidden=!r.manual?.length;links.replaceChildren();
- for(const asset of r.manual||[])links.append(button(asset.title+" ↗",()=>rpc("viewListing",{uid:asset.uid})));
+ for(const asset of r.manual||[]){
+   links.append(button(asset.title+" ↗",()=>rpc("viewListing",{uid:asset.uid})));
+   if(asset.status==="manual"){
+     links.append(el("small",null,claimReasons[asset.reason]||"打开 Fab 查看具体要求"));
+   }
+ }
  $("#retryFailed").hidden=r.running||!(c.manual||c.verify||c.retry);
  $("#claimRun").disabled=false;
  $("#claimRun").textContent=tr(r.running?"暂停入库":r.finished?"重新扫描":Object.keys(c).length?"继续入库":"开始入库");
  $("#free").textContent=tr(r.running?"免费入库中…":"一键免费入库");
  $("#range").disabled=$("#license").disabled=r.running;
  if(r.running){$("#range").value=r.scope;$("#license").value=r.tier}
+ if(finished)watchLibrarySession();
 }
 async function claimInfo(){
  const token=++claimToken;$("#claimRun").disabled=true;claimIdentity="";$("#claimNote").textContent=tr("正在读取账号与进度…");
@@ -875,7 +894,7 @@ function monitorClaimButton(){
  claimTimer=setInterval(async()=>{
    const r=await rpc("freeStatus");claimRunning=r.running;
    $("#free").textContent=tr(r.running?"免费入库中…":"一键免费入库");
-   if(!r.running)clearInterval(claimTimer);
+   if(!r.running){clearInterval(claimTimer);watchLibrarySession()}
  },3000);
 }
 $("#claim").onclose=()=>{claimToken++;monitorClaimButton()};

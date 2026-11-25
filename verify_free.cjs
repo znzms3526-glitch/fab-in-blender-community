@@ -2,7 +2,7 @@ const assert=require("node:assert/strict"),vm=require("node:vm"),fs=require("nod
 const source=fs.readFileSync(path.join(__dirname,"fab_shelf/runtime/owned.js"),"utf8");
 async function scenario({price=0,bundle=false,owns=false,accepted="accepted",acceptedAfterQuote=accepted,
                          unrealTerms,licenseSlug="personal",account="a",confirmed=true,single=true,rows,
-                         accountAtSubmit=account,fast=false,readError=0,postStatus=200,switchOn=""}={}){
+                         accountAtSubmit=account,fast=false,readError=0,postStatus=200,switchOn="",includeReason=false}={}){
  let posts=0,owned=owns;
  let reads=0, switched=false, quoted=false;
  const context={location:{origin:"https://www.fab.com"},document:{cookie:"fab_csrftoken=mock"},URLSearchParams,fetch:async(url,opts={})=>{
@@ -35,6 +35,7 @@ async function scenario({price=0,bundle=false,owns=false,accepted="accepted",acc
    }
    const check=await fn({...item,op:"checkFree"});
    const result=check.status==="available"?await fn({...item,op:"submitFree"}):check;
+   if(includeReason)return [result.status,posts,result.reason];
    return [result.message||result.status,posts];
  }
  catch(e){return [e.message,posts];}
@@ -67,6 +68,10 @@ async function manualAccess({ownership, accounts=["a","a"], fail}){
  for(const state of [null,true,"","true","not-accepted","outdated","unknown"])
    assert.deepEqual(await scenario({accepted:state}),["manual",0]);
  assert.deepEqual(await scenario({acceptedAfterQuote:"outdated"}),["manual",0]);
+ for(const [q,reason] of [[{bundle:true},"bundle"],[{accepted:false},"terms"],
+     [{acceptedAfterQuote:"outdated"},"terms"],[{price:50,accepted:false},"no_free_offer"]]){
+   assert.deepEqual(await scenario({...q,includeReason:true}),["manual",0,reason]);
+ }
  assert.deepEqual(await scenario({licenseSlug:"legacy-uem",unrealTerms:"pending"}),["manual",0]);
  assert.deepEqual(await scenario({licenseSlug:"legacy-uem",accepted:"pending",unrealTerms:"accepted"}),["added",1]);
  for(const rows of [[],{},[null],[{uid:"other",acquired:false}],[{uid:"x",acquired:"false"}],[{uid:"x",acquired:false},{uid:"x",acquired:true}]]){

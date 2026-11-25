@@ -89,7 +89,7 @@
 <label>HTTP 代理<input id="proxy" placeholder="http://127.0.0.1:7890"></label><small id="detected"></small>
 <p id="effective"></p><small>更换接口线路后可能需要重新登录 Epic。活动下载会沿原线路完成。</small><div class="controls"><button id="probe">测试可用线路</button><button id="recommend" hidden>采用推荐</button></div><div id="measure"></div></section>
 <section data-tab="入库" hidden><label>默认范围<select id="prefRange"><option value="quixel" selected>Quixel Megascans</option><option value="all">全部免费资产</option></select></label><label>默认许可<select id="prefTier"><option value="personal">个人</option><option value="professional">专业</option></select></label><label><input type="checkbox" id="background">关闭资产库窗口后继续入库</label></section>
-<section data-tab="存储" hidden><label>共享下载目录<input id="libraryDir"></label><small>目录变更在下次启动资产库会话时生效，已有文件保留在原目录。</small>
+<section data-tab="存储" hidden><label>Fab 下载库<input id="libraryDir"></label><small>目录切换后，已有文件和暂停任务保留在原库。</small><p id="libraryDirStatus" role="status" hidden></p>
 <label>浏览封面缓存上限<select id="coverMiB"><option>128</option><option>256</option><option>512</option><option>1024</option><option>2048</option></select> MiB</label>
 <p id="usage"></p><button id="clearPreview">清理浏览封面</button></section>
 <section data-tab="诊断" hidden><pre id="diag"></pre><button id="copyDiag">复制脱敏诊断</button></section>

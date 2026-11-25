@@ -3,6 +3,7 @@ import hashlib
 import tempfile
 from zipfile import BadZipFile
 import json
+from math import ceil
 import os
 import re
 import threading
@@ -15,7 +16,37 @@ from urllib.parse import urlsplit
 from urllib.request import Request, getproxies, proxy_bypass, urlopen
 
 from . import bl_info, catalog, scene, network, asset_library, bridge, storage
-from .free_task import FreeTask
+from .free_task import FreeTask, retry_after_seconds
+
+
+CACHE_SWITCH_MESSAGE = "正在切换下载库，请待当前任务完成后重试"
+CACHE_WRITES = {
+    "addNativeAsset", "bridgeCancel", "bridgeImport", "bridgePublish", "bridgeRemove", "bridgeScan",
+    "clearCovers", "clearJobs", "control", "deleteLocal", "favorite", "freeInfo", "freePause", "freeStart",
+    "get", "login", "logout", "pick", "queueListing", "saveSettings", "send", "submitBatch", "variant",
+}
+
+
+def validate_cache_path(value):
+    path = Path(str(value).strip())
+    if not path.is_absolute():
+        raise ValueError("请选择绝对路径作为共享下载库")
+    try:
+        path = path.resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path):
+            pass
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"无法使用 Fab 下载库 · {path} · {exc}") from exc
+    return path
+
+
+def cache_settings(cache):
+    path = cache / "preferences.json"
+    try:
+        return network.validate(json.loads(path.read_text(encoding="utf8")))
+    except FileNotFoundError:
+        return network.DEFAULTS.copy()
 
 
 def file_format(f):
@@ -62,19 +93,24 @@ def route(url):
 
 
 class Gallery:
-    def __init__(self,cache,box,project=None,manage_auth=False):
+    def __init__(self,cache,box,project=None,manage_auth=False, *, settings=None, switching_from=None):
         self.cache,self.box=cache,box
+        self.project_scope=project
         self.settings_path=cache/"preferences.json"
-        self.settings=network.validate(json.loads(self.settings_path.read_text(encoding="utf8"))) if self.settings_path.exists() else network.DEFAULTS.copy()
+        self.settings=cache_settings(cache) if settings is None else network.validate(settings)
         self.manage_auth=manage_auth
         self.auth=None
         self.last_error=""
         self.settings_lock=threading.Lock()
         self.logged_out=False
         self.project_state=dict(saved=True,waiting=0)
+        self.project_directory=""
         self.connection="尚未核验"
-        self.next_cache=None
-        self.cache_update=None
+        self.cache_change=None
+        self.cache_switching=switching_from is not None
+        self.cache_before_switch=switching_from
+        self.cache_writes=0
+        self.window_ready=threading.Event()
         self.last_test=None
         self.stop=threading.Event()
         self.bridge=bridge.BridgeLibrary(cache,self.stop)
@@ -86,6 +122,12 @@ class Gallery:
         self.library_content_revision=0
         self.library_head=None
         self.library_head_checked=0.0
+        self.library_check_active=False
+        self.library_next_check=0.0
+        self.library_pending={}
+        self.library_claim_generation=0
+        self.library_sync_attempts=0
+        self.fab_retry_until=0.0
         self.listing_checks={}
         self.batch_plans={}
         self.online_revision=0
@@ -135,25 +177,17 @@ class Gallery:
         new=network.validate(q["values"])
         import sys
         if sys.platform=="darwin" and new["apiRoute"]=="direct":raise ValueError("macOS 登录线路请选跟随系统或指定代理；文件下载可选直连")
-        destination=Path(q.get("cache") or self.cache)
-        if not destination.is_absolute():raise ValueError("共享目录须为绝对路径")
-        destination=destination.resolve()
-        if destination!=self.cache:
-            destination.mkdir(parents=True,exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=destination):pass
+        if self.request_cache_change(q.get("cache", self.cache), settings=new):
+            return self.settings_info()
         with self.api_lock:
             old=self.settings
             switched=old["apiRoute"]!=new["apiRoute"] or (new["apiRoute"]=="proxy" and new["proxy"]!=old["proxy"])
             try:
                 if switched and self.manage_auth:self.launch_auth(new)
                 catalog.atomic_json(self.settings_path,new)
-                if destination!=self.cache:catalog.atomic_json(destination/"preferences.json",new)
             except Exception:
                 if switched and self.manage_auth:self.launch_auth(old)
                 raise
-            if str(destination)!=(self.next_cache or str(self.cache)):
-                self.cache_update=str(destination)
-            self.next_cache=str(destination)
             self.settings=new
             self.preview_budget=new["coverMiB"]*1024*1024
             if switched:
@@ -171,9 +205,9 @@ class Gallery:
         return dict(values=s,defaults=network.DEFAULTS,systemProxy=network.system_proxy(),
                     apiLabel=network.LABELS[s["apiRoute"]]+(" · "+s["proxy"] if s["apiRoute"]=="proxy" else ""),
                     fileLabel=network.label(s["fileRoute"],s["proxy"]),
-                    connection=self.connection,taskState="运行中" if self.claims.running else "空闲",nextCache=self.next_cache,defaultCache=str(Path.home()/"FabShelfCache"),
-                    cache=str(self.cache),lastError=self.last_error,lastTest=self.last_test,
-                    version=".".join(map(str,bl_info["version"])))
+                    connection=self.connection,taskState="运行中" if self.claims.running else "空闲",defaultCache=str(Path.home()/"FabShelfCache"),
+                    lastError=self.last_error,lastTest=self.last_test,
+                    version=".".join(map(str,bl_info["version"])),**self.cache_path_info())
 
     def clear_online_caches(self):
         with self.lock:
@@ -194,6 +228,9 @@ class Gallery:
             previous=self.library_account
             self.library_account=uid
             self.library_revision+=1
+            self.library_pending.clear()
+            self.library_next_check=0.0
+            self.library_sync_attempts=0
             if previous is not None:
                 self.clear_online_caches()
                 self.claims.pause.set()
@@ -203,10 +240,13 @@ class Gallery:
                     self.persist(job)
             return uid,self.library_revision
 
-    def library_session(self, request_id=None):
+    def library_session(self, request_id=None, *, automatic=False):
         # Serialize observations so that an older response cannot restore a previous account.
         with self.library_session_lock:
-            account=self.api(dict(op="account",allowSignedOut=True),request_id)
+            query=dict(op="account",allowSignedOut=True)
+            if automatic:query["_automaticLibrary"]=True
+            account=self.api(query,request_id)
+            if account is None:return "",None
             uid=account.get("uid")
             if not isinstance(uid,str):
                 raise ValueError("Fab 响应格式异常，请稍后重试")
@@ -217,35 +257,78 @@ class Gallery:
     def library_stamp(self, data):
         return tuple(sorted(item["uid"] for item in data["items"] if item.get("uid")))
 
+    def mark_library_dirty(self, account, uids, revision=None):
+        with self.lock:
+            if account!=self.library_account or (revision is not None and revision!=self.library_revision):
+                return
+            self.library_claim_generation+=1
+            self.library_pending.update(dict.fromkeys(uids,self.library_claim_generation))
+            self.library_sync_attempts=0
+
+    def finish_library_check(self, revision, generation, data):
+        with self.lock:
+            if revision!=self.library_revision:
+                return
+            if data is not None:
+                head=self.library_stamp(data)
+                if head or not data["next"]:
+                    has_cached_view=any(key[0]=="library" for key,_ in self.page_cache)
+                    if head!=self.library_head and (self.library_head is not None or has_cached_view):
+                        self.library_content_revision+=1
+                        self.page_cache={key:value for key,value in self.page_cache.items()
+                                         if key[0][0]!="library"}
+                        self.cursors={key:value for key,value in self.cursors.items() if key[0]!="library"}
+                        self.facets.clear()
+                    self.library_head=head
+                    # A head change may show only some results or reflect an unrelated acquisition.
+                    for uid in head:
+                        pending=self.library_pending.get(uid)
+                        if pending is not None and pending<=generation:
+                            self.library_pending.pop(uid)
+            else:
+                self.library_next_check=time.monotonic()+24
+            if not self.library_pending:
+                self.library_sync_attempts=0
+            elif not self.claims.running and generation==self.library_claim_generation:
+                self.library_sync_attempts+=1
+                if self.library_sync_attempts>=3:
+                    self.library_pending.clear()
+                    self.library_sync_attempts=0
+                else:
+                    delay=(24,45)[self.library_sync_attempts-1]
+                    self.library_next_check=time.monotonic()+delay
+
     def library_status(self):
-        account, revision = self.library_session()
+        try:
+            account, revision = self.library_session(automatic=True)
+        except ValueError as exc:
+            if retry_after_seconds(exc) is None:raise
+            account, revision = "",None
+        deferred=revision is None
         with self.lock:
             now = time.monotonic()
-            check = bool(account) and revision == self.library_revision and not self.claims.running and (
-                now - self.library_head_checked >= 12)
+            check = (bool(account) and revision==self.library_revision and not self.library_check_active
+                     and (bool(self.library_pending) or not self.claims.running)
+                     and now>=self.library_next_check and now-self.library_head_checked>=12)
             if check:
                 self.library_head_checked = now
+                self.library_check_active=True
+                generation=self.library_claim_generation
         if check:
             try:
-                data = self.api(dict(op="library", kind="ALL", cursor="", account=account))
-            except ValueError:
-                # A failed freshness check leaves the last verified library visible.
-                pass
+                data = self.api(dict(op="library",kind="ALL",cursor="",account=account,_automaticLibrary=True))
+            except ValueError as exc:
+                self.finish_library_check(revision,generation,None)
+                deferred=retry_after_seconds(exc) is not None
             else:
-                head = self.library_stamp(data)
+                deferred=data is None
+                if not deferred:self.finish_library_check(revision,generation,data)
+            finally:
                 with self.lock:
-                    if revision == self.library_revision and (head or not data["next"]):
-                        has_cached_view = any(key[0] == "library" for key, _ in self.page_cache)
-                        if head != self.library_head and (self.library_head is not None or has_cached_view):
-                            self.library_content_revision += 1
-                            self.page_cache = {key: value for key, value in self.page_cache.items()
-                                               if key[0][0] != "library"}
-                            self.cursors = {key: value for key, value in self.cursors.items() if key[0] != "library"}
-                            self.facets.clear()
-                        self.library_head = head
+                    self.library_check_active=False
         with self.lock:
             return dict(libraryRevision=self.library_revision, libraryContentRevision=self.library_content_revision,
-                        signedIn=bool(self.library_account))
+                        signedIn=bool(self.library_account),automaticDeferred=deferred)
 
     def speed_test(self,proxy):
         proxy=network.proxy_address(proxy)
@@ -320,12 +403,76 @@ class Gallery:
                 if re.fullmatch(r"[a-f0-9]{64}", cached) and blob.is_file():
                     done = blob.stat().st_size
                 j.update(part=part,state="暂停",done=done,active=False,speed=0,route="",error="")
+                for request in (j.get("intent"),j.get("variant")):
+                    if request:
+                        request.setdefault("project_directory","")
                 self.jobs[j["id"]]=j
             except (OSError,ValueError,KeyError):continue
 
     def busy(self):
         with self.lock:
-            return self.claims.running or self.bridge.running or self.pending_exports or any(j["active"] or j["state"]=="等待" for j in self.jobs.values())
+            return self.cache_writes or self.claims.running or self.bridge.running or self.pending_exports or any(j["active"] or j["state"]=="等待" for j in self.jobs.values())
+
+    def request_cache_change(self, value, *, settings=None):
+        target = validate_cache_path(value)
+        with self.lock:
+            if self.cache_change is not None or self.cache_switching:
+                raise ValueError(CACHE_SWITCH_MESSAGE)
+            if target == self.cache:
+                return False
+            self.cache_change = (target, dict(self.settings if settings is None else settings))
+        self._notify_cache_change()
+        return True
+
+    def cache_path_info(self):
+        with self.lock:
+            if self.cache_before_switch is not None:
+                return dict(cache=str(self.cache_before_switch),nextCache=str(self.cache),cacheSwitching=True)
+            target = self.cache_change[0] if self.cache_change else None
+            return dict(cache=str(self.cache),nextCache=str(target) if target else None,
+                        cacheSwitching=self.cache_switching)
+
+    def _notify_cache_change(self):
+        try:
+            self._reply({},cacheChange=self.cache_path_info())
+        except OSError:
+            pass
+
+    def adopt_cache(self):
+        with self.lock:
+            self.cache_before_switch = None
+            self.cache_switching = False
+        self._notify_cache_change()
+
+    def take_idle_cache_change(self):
+        with self.lock:
+            if self.cache_change is None or self.cache_switching or self.busy():
+                return None
+            self.cache_switching = True
+            return self.cache_change
+
+    def _admit_cache_write(self, *, can_stop_work=False):
+        with self.lock:
+            if self.cache_switching or (self.cache_change is not None and not can_stop_work):
+                raise ValueError(CACHE_SWITCH_MESSAGE)
+            self.cache_writes += 1
+
+    def _run_cache_write(self, call, args):
+        try:
+            return call(*args)
+        finally:
+            with self.lock:
+                self.cache_writes -= 1
+
+    def submit_cache_write(self, call, *args):
+        self._admit_cache_write()
+        try:
+            future = self.pool.submit(self._run_cache_write, call, args)
+        except RuntimeError:
+            with self.lock:
+                self.cache_writes -= 1
+            raise
+        return future
 
     def close(self):
         self.claims.pause.set()
@@ -339,7 +486,13 @@ class Gallery:
 
     def join(self):
         self.thread.join()
-        if self.auth:self.auth.wait(timeout=5)
+        if self.auth:
+            from subprocess import TimeoutExpired
+            try:
+                self.auth.wait(timeout=5)
+            except TimeoutExpired:
+                self.auth.kill()
+                self.auth.wait()
         self.pool.shutdown(wait=True,cancel_futures=True)
         self.cover_pool.shutdown(wait=True,cancel_futures=True)
         if self.bridge.worker:self.bridge.worker.join()
@@ -484,17 +637,32 @@ class Gallery:
     def api(self,q,request_id=None):
         with self.api_lock:
             if self.stop.is_set():raise ValueError("窗口已关闭")
+            remaining=max(self.fab_retry_until-time.monotonic(),
+                          self.claims.info.get("retryAt",0)-time.time())
+            if remaining>0:
+                if q.get("_automaticLibrary"):return None
+                if q.get("op") in {"freePage","ownedBatch","checkFree","submitFree"}:
+                    message=f"Fab HTTP 429 retry={ceil(remaining)}"
+                    if q.get("op")=="submitFree":return dict(status="beforeSubmitError",message=message)
+                    raise ValueError(message)
             session_probe=q.get("op")=="account" and q.get("allowSignedOut") is True
             if self.logged_out and q.get("op")!="logout" and not session_probe:raise ValueError("请先登录 Fab")
             if request_id and self.latest_page!=request_id:raise ValueError("搜索已更新")
             token=uuid.uuid4().hex
-            catalog.atomic_json(self.box/"cmd",dict(q,rid=token))
+            request=dict(q,rid=token)
+            request.pop("_automaticLibrary",None)
+            catalog.atomic_json(self.box/"cmd",request)
             deadline=time.monotonic()+50
             while not self.stop.wait(.06):
                 p=self.box/"reply"
                 if p.exists():
                     r=json.loads(p.read_text(encoding="utf-8-sig"));p.unlink()
                     if r.get("rid")!=token:continue
+                    error=r.get("error")
+                    if q.get("op")=="submitFree" and r.get("status") in {"rejected","beforeSubmitError"}:
+                        error=r.get("message",error)
+                    if delay:=retry_after_seconds(error):
+                        self.fab_retry_until=max(self.fab_retry_until,time.monotonic()+delay)
                     if r.get("error"):
                         if any(s in str(r["error"]) for s in ("登录","401","403")):self.connection="需重新验证"
                         raise ValueError(r["error"])
@@ -518,9 +686,7 @@ class Gallery:
                             continue
                         self.view_generations[session]=generation
                         self.latest_page=q.get("id")
-                    if q.get("op") in {"jobs","control","clearJobs"}:self.reply(q)
-                    elif q.get("op")=="cover":self.cover_pool.submit(self.reply,q)
-                    else:self.pool.submit(self.reply,q)
+                    self._dispatch_request(q)
                 with self.lock:
                     if not any(j["active"] for j in self.jobs.values()):
                         j=next((j for j in self.jobs.values() if j["state"]=="等待"),None)
@@ -529,13 +695,37 @@ class Gallery:
                             self.pool.submit(self.run_job,j)
             except (OSError,RuntimeError):continue
 
+    def _dispatch_request(self,q):
+        q = self.project_request(q)
+        op = q.get("op")
+        try:
+            if op == "jobs":
+                self.reply(q)
+            elif op == "cover":
+                self.cover_pool.submit(self.reply,q)
+            elif op in {"control", "clearJobs", "freePause", "bridgeCancel"}:
+                can_stop = op in {"freePause", "bridgeCancel"} or (op == "control" and q.get("action") in {"pause", "cancel"})
+                self._admit_cache_write(can_stop_work=can_stop)
+                self._run_cache_write(self.reply, (q,))
+            elif op in CACHE_WRITES:
+                self.submit_cache_write(self.reply,q)
+            else:
+                self.pool.submit(self.reply,q)
+        except ValueError as e:
+            self._reply(q,error=str(e))
+
+    def _reply(self,q,**out):
+        if not self.stop.is_set() and self.box.exists():
+            catalog.atomic_json(self.box/("out-"+uuid.uuid4().hex),dict(id=q.get("id"),**out))
+
     def reply(self,q):
         try:out=dict(result=self.handle(q))
         except Exception as e:
             self.last_error=q.get("op","")+" · "+type(e).__name__
             out=dict(error=str(e))
-        if not self.stop.is_set() and self.box.exists():
-            catalog.atomic_json(self.box/("out-"+uuid.uuid4().hex),dict(id=q.get("id"),**out))
+        self._reply(q,**out)
+        if q.get("op")=="settings" and "error" not in out:
+            self.window_ready.set()
 
     def metadata_path(self,uid):
         return self.cache/"listing-categories"/(hashlib.sha256(uid.encode()).hexdigest()+".json")
@@ -755,7 +945,7 @@ class Gallery:
             return self.request_variant(dict(q, uid=verified["asset"]["uid"]), verified)
         f=next((f for f in verified["files"] if f["uid"]==q.get("file")),None)
         if f is None:raise ValueError("此商品无可用的 Blender 格式")
-        return self.enqueue(dict(uid=verified["asset"]["uid"],file=f["uid"],k=f["k"],fmt=f["fmt"]),verified)
+        return self.enqueue(dict(q,uid=verified["asset"]["uid"],file=f["uid"],k=f["k"],fmt=f["fmt"]),verified)
 
     def preview_batch(self,q):
         texture_k, fmt = q["textureK"], q["fmt"]
@@ -870,6 +1060,8 @@ class Gallery:
         return min(copies, key=distance, default=None), inspected
 
     def request_variant(self, q, verified=None, *, lookup=None):
+        if q.get("import") and "project_directory" not in q:
+            q=dict(q,project_directory=self.project_directory)
         self.refresh_local()
         uid, fmt, target = q["uid"], q["fmt"], int(q["textureK"])
         if target not in (1, 2, 4, 8, 16):
@@ -919,7 +1111,7 @@ class Gallery:
             if q.get("preview"):
                 return dict(state="download")
             file = min(likely or untested, key=lambda f: (abs(f["k"]-target) if f["k"] else float("inf"), f["bytes"] or float("inf")))
-            plan = {key:q[key] for key in ("action","target","shared") if key in q}
+            plan = {key:q[key] for key in ("action","target","shared","project_directory") if key in q}
             plan.update(fmt=fmt,textureK=target,**{"import":bool(q.get("import"))})
             snapshot = dict(asset=asset, files=files, account=account)
             message = self.enqueue(dict(uid=uid,k=file["k"],fmt=file["fmt"],file=file["uid"]),snapshot,variant=plan)
@@ -956,6 +1148,8 @@ class Gallery:
         return dict(state="cached", message=f"{action} · {notice}", notice=notice, dimensions=known)
 
     def enqueue(self,q,verified=None,*,variant=None):
+        if q.get("import") and "project_directory" not in q:
+            q=dict(q,project_directory=self.project_directory)
         self.refresh_local()
         uid=q["uid"];k=int(q["k"]);fmt=q.get("fmt","")
         if q.get("action")=="textures":
@@ -995,20 +1189,24 @@ class Gallery:
                 if variant:
                     previous = old.get("variant", {})
                     plan = dict(variant, files=opts)
-                    if previous.get("import") and plan["import"] and (previous.get("action") or plan.get("action")) and (
-                        previous.get("action"),previous.get("target")
-                    ) != (plan.get("action"),plan.get("target")):
+                    if previous.get("import") and plan["import"] and (
+                        previous.get("action"),previous.get("target"),previous.get("project_directory","")
+                    ) != (plan.get("action"),plan.get("target"),plan.get("project_directory","")):
                         raise ValueError("该规格已有导入任务，请在完成后重试")
                     if previous.get("import") and not variant["import"]:
                         plan = previous
-                    old["variant"] = plan
-                    if plan["import"] and old["intent"] and not old["intent"].get("action"):
+                    intent = old["intent"]
+                    if plan["import"] and intent and not intent.get("action"):
+                        if intent.get("project_directory","")!=plan.get("project_directory",""):
+                            raise ValueError("该规格已有导入任务，请在完成后重试")
                         old["intent"] = None
+                    old["variant"] = plan
                     if account:
                         old["account"] = account
                     self.persist(old)
                 if q.get("import") and q!=old["intent"]:
-                    if old["intent"] and (q.get("action") or old["intent"].get("action")):
+                    if old["intent"] and (q.get("action") or old["intent"].get("action")
+                                         or old["intent"].get("project_directory","")!=q["project_directory"]):
                         raise ValueError("该规格已有导入任务，请在完成后重试")
                     old["intent"]=q
                     self.persist(old)
@@ -1084,6 +1282,7 @@ class Gallery:
     def send(self,r,k,q):
         names=catalog.local_files(self.cache,r)
         action=q.get("action")
+        directory=q.get("project_directory",self.project_directory)
         if action in {"textures","repair"}:
             if action=="repair" and r["hash"]!=q["source"]["hash"]:
                 raise ValueError("下载包与工程记录不一致，请核对资产版本")
@@ -1093,13 +1292,18 @@ class Gallery:
                 k=int(q.get("textureK",q.get("k",k)))
                 chosen,_=self.external_textures(r,k,names)
             if not chosen or not set(chosen)<=set(names):raise ValueError("此规格没有可用的独立贴图")
-            request=dict(hash=r["hash"],name=r["name"],source=self.import_source(r,k))
-            catalog.atomic_json(self.box/(uuid.uuid4().hex+".json"),dict(request,mode=1,files=chosen,action=action,target=q.get("target"),shared=q.get("shared",False)))
+            request=dict(hash=r["hash"],name=r["name"],source=self.import_source(r,k),mode=1,
+                         files=chosen,action=action,target=q.get("target"),shared=q.get("shared",False),
+                         project_directory=directory)
+            if action=="repair" and q.get("repair_targets"):
+                request["repair_targets"]=q["repair_targets"]
+            catalog.atomic_json(self.box/(uuid.uuid4().hex+".json"),request)
             return
         request=self.local_import(r,k,q,names)
         if q.get("files") is not None:
             catalog.atomic_json(self.cache/"records"/(r["hash"]+".gallery"),{k:request[k] for k in ("files","mode")})
-        catalog.atomic_json(self.box/(uuid.uuid4().hex+".json"),dict(request,independent=bool(q.get("independent"))))
+        catalog.atomic_json(self.box/(uuid.uuid4().hex+".json"),
+                            dict(request,independent=bool(q.get("independent")),project_directory=directory))
 
     def add_native_asset(self,q):
         request=self.local_import(self.selected_copy(q),int(q["k"]),q)
@@ -1317,6 +1521,11 @@ class Gallery:
             self.record_stamp = None
         return dict(message="已删除本地缓存文件", hash=digest, uid=uid, removedBlob=removed_blob)
 
+    def project_request(self,q):
+        if q.get("op") in {"get","variant","send","queueListing","bridgeImport"}:
+            return dict(q,project_directory=self.project_directory)
+        return q
+
     def handle(self,q):
         op=q["op"]
         if op=="projectState":return self.project_state
@@ -1336,6 +1545,7 @@ class Gallery:
             if op == "bridgePublish":
                 self.bridge.cover(q["uid"])
                 return self.publish_native_asset(request)
+            request["project_directory"]=q.get("project_directory",self.project_directory)
             catalog.atomic_json(self.box / (uuid.uuid4().hex + ".json"), request)
             return self.import_notice()
         if op in {"get","members","send","pick","cacheStats","clearCovers","addNativeAsset","deleteLocal"} or (op=="presence" and q["scope"]=="local"):
@@ -1350,9 +1560,11 @@ class Gallery:
             path=self.claims.inspect(account,q["range"],q["tier"])
             return dict(self.claims.status(path),account=account["name"],identity=account["uid"])
         if op=="freeStart":
-            account=self.api(dict(op="account"))
-            if account["uid"]!=q["identity"]:raise ValueError("账号已切换，请重新打开入库面板")
-            return self.claims.start(account,q["range"],q["tier"],bool(q.get("retryOnly")))
+            with self.library_session_lock:
+                account=self.api(dict(op="account"))
+                if account["uid"]!=q["identity"]:raise ValueError("账号已切换，请重新打开入库面板")
+                _,revision=self.remember_library_account(account["uid"])
+                return self.claims.start(account,q["range"],q["tier"],bool(q.get("retryOnly")),revision)
         if op=="freeStatus":return self.claims.status()
         if op=="freePause":self.claims.pause.set();return self.claims.status()
         if op=="refreshFacets":self.facets.clear();return True
@@ -1444,8 +1656,23 @@ class Gallery:
             rec=catalog.add_package(self.cache,Path(q["path"]))
             self.record_local(rec)
             return "已添加 · "+rec["name"]
+        if op=="openDownloadFolder":
+            directory=self.cache/"packages"
+            if os.name=="nt":
+                os.startfile(directory)
+            else:
+                import subprocess
+                subprocess.Popen(["open",str(directory)])
+            return True
         if op=="jobs":
-            with self.lock:return [{k:j[k] for k in ("id","title","state","done","total","speed","route","error","active")}|{"uid":j["asset"]["uid"],"k":j["file"].get("k",0),"fmt":j["file"].get("fmt",""),"notice":j.get("notice",""),"textureK":j.get("variant",{}).get("textureK")} for j in self.jobs.values()]
+            with self.lock:
+                return [
+                    {key:job[key] for key in ("id","title","state","done","total","speed","route","error","active")}
+                    | dict(uid=job["asset"]["uid"],k=job["file"].get("k",0),fmt=job["file"].get("fmt",""),
+                           notice=job.get("notice",""),textureK=job.get("variant",{}).get("textureK"),
+                           directory=str(self.cache/"packages") if job["state"]=="完成" else "")
+                    for job in self.jobs.values()
+                ]
         if op=="clearJobs":
             with self.lock:
                 targets=[jid for jid,j in list(self.jobs.items()) if not j["active"] and j["state"] in {"完成","已取消","失败"}]
