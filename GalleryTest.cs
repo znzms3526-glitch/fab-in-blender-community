@@ -50,11 +50,11 @@ class GalleryTest {
                     await Wait(view,"!document.querySelector('#inspect').open && qaVariantRequests.some(r=>r.textureK===8 && r.fmt==='GLB' && !r.import)");
                     await view.CoreWebView2.ExecuteScriptAsync("pickCardVariant(2,'GLB');document.querySelector('.card .primary').click()");
                     await Wait(view,"qaVariantRequests.some(r=>r.textureK===2 && r.fmt==='GLB')");
-                    await view.CoreWebView2.ExecuteScriptAsync("scope='local';paint();pickCardVariant(4,'FBX');document.querySelector('.card .primary').click()");
+                    await view.CoreWebView2.ExecuteScriptAsync("scope='local';pickCardVariant(4,'FBX');document.querySelector('.card .primary').click()");
                     await Wait(view,"qaVariantRequests.some(r=>r.textureK===4 && r.fmt==='FBX' && r.import)");
                     await view.CoreWebView2.ExecuteScriptAsync("document.querySelector('.card .options').click();document.querySelector('.local-actions .primary').click()");
                     await Wait(view,"qaVariantRequests.filter(r=>r.textureK===4 && r.fmt==='FBX' && r.import).length===2");
-                    await view.CoreWebView2.ExecuteScriptAsync("document.querySelector('#inspect header button').click();rpc=qaVariantRpc;scope='owned';paint();pickCardVariant(1,'FBX')");
+                    await view.CoreWebView2.ExecuteScriptAsync("document.querySelector('#inspect header button').click();rpc=qaVariantRpc;scope='owned';pickCardVariant(1,'FBX')");
                     await Wait(view,"document.querySelector('.card .primary').textContent===tr('导入') && document.querySelector('.card .levels [aria-pressed=true]').textContent==='1K'");
                     await view.CoreWebView2.ExecuteScriptAsync("window.qaImage=document.querySelector('.card img');window.qaRpc=rpc;window.qaJob={id:'qa',uid:items[0].uid,k:4,fmt:'FBX',state:'下载中',done:37,total:100,active:true};rpc=(op,data)=>op==='jobs'?Promise.resolve([window.qaJob]):window.qaRpc(op,data);poll()");
                     await Wait(view,"document.querySelector('.download-status')?.textContent.includes('4K FBX') && document.querySelector('.download-status').textContent.includes('37%') && qaImage===document.querySelector('.card img')");
@@ -134,9 +134,9 @@ class GalleryTest {
                 await Wait(view,"scope==='favorites' && kind==='ALL' && !category && !document.querySelector('#query').value && items.length===1 && document.querySelector('.star')?.getAttribute('aria-pressed')==='true'");
                 await view.CoreWebView2.ExecuteScriptAsync("document.querySelector('.star').click()");
                 await Wait(view,"scope==='favorites' && items.length===0");
-                await view.CoreWebView2.ExecuteScriptAsync("scope='owned';category='';kind='3d-model';page=1;load()");
+                await view.CoreWebView2.ExecuteScriptAsync("scope='owned';category='';kind='3d-model';load()");
                 await Wait(view,"items.length>1 && [...document.images].slice(0,8).filter(i=>i.naturalWidth>0).length===8");                using(var output=File.Create(Path.Combine(args[0],"preview.png")))await view.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png,output);
-                await Wait(view,"document.querySelector('#pager').getBoundingClientRect().bottom<=innerHeight+1");
+                await Wait(view,"document.querySelector('#scroll').getBoundingClientRect().bottom<=innerHeight+1 && !!document.querySelector('#feedSentinel')");
                 await view.CoreWebView2.ExecuteScriptAsync("document.querySelector('#query').value='Urban Trash Box Cardboard Damaged 01';document.querySelector('#query').dispatchEvent(new Event('input'))");
                 await Wait(view,"document.querySelectorAll('.card').length===1 && document.querySelector('.card .name').textContent.includes('Cardboard')");
                 await Wait(view,"document.querySelector('.card .primary').textContent===tr('导入') && scope==='owned'");

@@ -15,6 +15,10 @@ from .storage import (MODELS, IMAGES, archive_members, file_lock, file_matches, 
                       removing_files, texture_variant_key)
 
 
+DIMENSION_META_VERSION = 1
+DIMENSION_META_LIMIT = 4 * 1024 * 1024
+
+
 def size(name):
     match = re.search(r"(?<![a-z0-9])([1248]|16)k(?![a-z0-9])", name, re.I)
     return int(match[1]) if match else 0
@@ -138,28 +142,93 @@ def glb_dimensions(stream, name, *, image_names=None):
 def texture_dimensions(blob, name):
     sizes = {}
     try:
-        if zipfile.is_zipfile(blob):
-            with zipfile.ZipFile(blob) as archive, archive_members(archive) as members:
-                for member, (container, item) in members.items():
-                    if Path(member).suffix.lower() == ".glb":
-                        with container.open(item) as stream:
-                            sizes.update(glb_dimensions(stream, member))
-                    elif Path(member).suffix.lower() in IMAGES:
-                        with container.open(item) as stream:
-                            size_px = image_dimensions(stream, Path(member).suffix.lower())
-                        if size_px and min(size_px) > 0:
-                            sizes[member] = size_px
-        elif Path(name).suffix.lower() == ".glb":
-            with blob.open("rb") as stream:
+        with blob.open("rb") as stream:
+            if zipfile.is_zipfile(stream):
+                with zipfile.ZipFile(stream) as archive, archive_members(archive) as members:
+                    for member, (container, item) in members.items():
+                        suffix = Path(member).suffix.lower()
+                        if suffix == ".glb":
+                            with container.open(item) as image:
+                                sizes.update(glb_dimensions(image, member))
+                        elif suffix in IMAGES:
+                            with container.open(item) as image:
+                                size_px = image_dimensions(image, suffix)
+                            if size_px and min(size_px) > 0:
+                                sizes[member] = size_px
+                return sizes
+            stream.seek(0)
+            suffix = Path(name).suffix.lower()
+            if suffix == ".glb":
                 sizes.update(glb_dimensions(stream, name))
-        elif Path(name).suffix.lower() in IMAGES:
-            with blob.open("rb") as stream:
-                size_px = image_dimensions(stream, Path(name).suffix.lower())
-            if size_px and min(size_px) > 0:
-                sizes[name] = size_px
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError, zipfile.BadZipFile, EOFError):
+            elif suffix in IMAGES:
+                size_px = image_dimensions(stream, suffix)
+                if size_px and min(size_px) > 0:
+                    sizes[name] = size_px
+    except OSError:
+        return None
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, zipfile.BadZipFile, EOFError):
         pass
     return sizes
+
+
+def package_fingerprint(blob):
+    try:
+        info = blob.stat()
+    except OSError:
+        return None
+    return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_ino)
+
+
+def package_meta_path(cache, digest):
+    return fs_path(cache / "package-meta" / (digest + ".json"))
+
+
+def read_package_dimensions(path, identity):
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(DIMENSION_META_LIMIT + 1)
+        if len(raw) > DIMENSION_META_LIMIT:
+            return None
+        saved = json.loads(raw)
+        if not isinstance(saved, dict) or saved.get("identity") != identity:
+            return None
+        saved = saved.get("dimensions")
+        if not isinstance(saved, dict):
+            return None
+        dimensions = {}
+        for member, value in saved.items():
+            if value is None:
+                dimensions[member] = None
+            elif isinstance(value, list) and len(value) == 2 and all(type(px) is int and px > 0 for px in value):
+                dimensions[member] = tuple(value)
+            else:
+                return None
+        return dimensions
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def cached_package_dimensions(cache, blob, digest, name, fingerprint):
+    path = package_meta_path(cache, digest)
+    # Member names are part of a ZIP's contents. The package's display name
+    # only changes the keys returned for a standalone image or GLB.
+    identity = [DIMENSION_META_VERSION, ".zip" if name.lower().endswith(".zip") else name, *fingerprint]
+    hit = read_package_dimensions(path, identity)
+    if hit is not None:
+        return hit if package_fingerprint(blob) == fingerprint else None
+    dimensions = texture_dimensions(blob, name)
+    if dimensions is None or package_fingerprint(blob) != fingerprint:
+        return None
+    try:
+        # A concurrent install or delete can only proceed before this recheck or after the write.
+        with package_update(cache, timeout=0):
+            if package_fingerprint(blob) != fingerprint:
+                return None
+            atomic_json(path, dict(identity=identity, dimensions=dimensions))
+    except (OSError, ValueError):
+        # Dimensions remain usable when the optional disk cache is unavailable.
+        pass
+    return dimensions
 
 
 SUBPART_RE = re.compile(
@@ -303,8 +372,8 @@ def atomic_json(path, obj):
 
 
 @contextmanager
-def package_update(cache):
-    with file_lock(cache / "package-index.lock", timeout=5):
+def package_update(cache, *, timeout=5):
+    with file_lock(cache / "package-index.lock", timeout=timeout):
         recover_removal(cache, cache / ".package-removal")
         yield
 
@@ -403,7 +472,7 @@ def delete_package_record(cache, digest, uid, favorite=None):
         files = [path for path, _ in removed]
         removed_blob = not survivors and fs_path(blob).is_file()
         if not survivors:
-            files = [blob, *files, records / f"{digest}.gallery"]
+            files = [blob, *files, records / f"{digest}.gallery", package_meta_path(cache, digest)]
         if favorite is not None:
             files.append(favorite)
         try:
@@ -440,7 +509,7 @@ def transfer(cache, url, listing, item, progress=None):
         path.unlink(missing_ok=True)
 
 
-def thumbnail(cache, key, rec, open_url=urlopen):
+def thumbnail(cache, key, rec, fetch_cover):
     directory=cache/"previews"
     directory.mkdir(parents=True,exist_ok=True)
     dst=directory/(hashlib.sha256(key.encode()).hexdigest()+".img")
@@ -449,11 +518,7 @@ def thumbnail(cache, key, rec, open_url=urlopen):
     data=None
     url=rec.get("thumb")
     if url and url.startswith("https://"):
-        try:
-            with open_url(Request(url,headers={"User-Agent":"Mozilla/5.0"}),timeout=12) as res:
-                data=res.read(8_000_001)
-        except OSError:
-            pass
+        data=fetch_cover(url)
     if not data and rec.get("hash"):
         blob=cache/"packages"/rec["hash"]
         if zipfile.is_zipfile(blob):

@@ -1,5 +1,19 @@
 async function fabRequest(q) {
+  if(q.idleMetadata!==true || !["presence","taxonomy","detail"].includes(q.op) ||
+     !/^[a-f0-9]{32}$/.test(q.rid))return runFabRequest(q);
+  const controller=new AbortController(), key="__fabShelfMetadata_"+q.rid;
+  globalThis[key]=controller;
+  const timer=setTimeout(()=>controller.abort(),8000);
+  try{return await runFabRequest(q,controller.signal)}
+  catch(error){if(controller.signal.aborted)return {deferred:true};throw error}
+  finally{clearTimeout(timer);delete globalThis[key]}
+}
+
+async function runFabRequest(q,metadataSignal) {
   if (location.origin !== "https://www.fab.com") throw Error("请先登录 Fab");
+  const signal=metadataSignal ?? (q.op==="library" && q.verifyAccount===true && q.lookahead===true &&
+               typeof AbortSignal!=="undefined" && typeof AbortSignal.timeout==="function"
+               ? AbortSignal.timeout(6500) : undefined);
   function httpError(r){
     let hint="";
     if(r.status===429){
@@ -10,7 +24,7 @@ async function fabRequest(q) {
     return Error("Fab HTTP "+r.status+hint);
   }
   async function get(path,cache="default") {
-    const r = await fetch(path, {credentials:"same-origin",cache,headers:{"Accept":"application/json","X-Requested-With":"XMLHttpRequest"}});
+    const r = await fetch(path, {credentials:"same-origin",cache,signal,headers:{"Accept":"application/json","X-Requested-With":"XMLHttpRequest"}});
     if (!r.ok) throw httpError(r);
     const raw=await r.text();
     try{return JSON.parse(raw)}catch{
@@ -64,7 +78,7 @@ async function fabRequest(q) {
       await Promise.all(q.values.slice(i,i+3).map(async value=>{
         const p=new URLSearchParams({listing_types:q.kind||value});
         if(q.kind)p.set("categories",value);
-        const res=await fetch("/i/library/search?"+p,{credentials:"same-origin",headers:{"Accept":"application/json","X-Requested-With":"XMLHttpRequest"}});
+        const res=await fetch("/i/library/search?"+p,{credentials:"same-origin",signal,headers:{"Accept":"application/json","X-Requested-With":"XMLHttpRequest"}});
         if(res.status===400 || res.status===404)return;
         if(!res.ok)throw Error("Fab HTTP "+res.status);
         const r=await res.json();
@@ -192,12 +206,28 @@ async function fabRequest(q) {
     if(q.category)p.set("categories",q.category);
     if(q.query)p.set("q",q.query);
     if(q.cursor)p.set("cursor",q.cursor);
-    if(q.op==="library")await checkLibraryAccount();
-    const page=await get((q.op==="library"?"/i/library/search?":"/i/listings/search?")+p,
-                         q.op==="library"?"no-store":"default");
-    if(q.op==="library")await checkLibraryAccount();
+    const library=q.op==="library", bound=library&&q.verifyAccount===true;
+    let observedAccount;
+    if(bound){
+      observedAccount=(await account(true)).uid;
+      if(!observedAccount||observedAccount!==q.account)return {observedAccount};
+    }else if(library)await checkLibraryAccount();
+    let page;
+    try{
+      page=await get((library?"/i/library/search?":"/i/listings/search?")+p,library?"no-store":"default");
+    }catch(error){
+      if(bound && /^Fab HTTP (401|403)$/.test(error.message)){
+        observedAccount=(await account(true)).uid;
+        if(observedAccount!==q.account)return {observedAccount};
+      }
+      throw error;
+    }
+    if(bound){
+      observedAccount=(await account(true)).uid;
+      if(observedAccount!==q.account)return {observedAccount};
+    }else if(library)await checkLibraryAccount();
     if(!Array.isArray(page.results))throw Error("Fab 个人库格式已变更");
-    return {items:page.results.map(e=>{
+    return {...(bound?{observedAccount}:{}),items:page.results.map(e=>{
       const x=typeof e.listing==="object"&&e.listing?e.listing:e;
       const uid=q.op==="discover"?e.uid:x===e?(e.listingUid || (typeof e.listing==="string"?e.listing:null)):x.uid;
       return {uid,discovery:q.op==="discover",category:x.category?.slug||"",title:x.title||e.title||"",thumb:photo(x)||photo(e),kind:x.listingType?.code||x.listingType||""};

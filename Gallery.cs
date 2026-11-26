@@ -15,6 +15,7 @@ class Gallery : Form {
     readonly string box;
     readonly Process parent;
     readonly FabBrowser browse;
+    IpcWakeup wakeup;
     bool ready;
     static string Field(Dictionary<string,object> fields,string key) {
         object value;
@@ -26,9 +27,15 @@ class Gallery : Form {
         Text="Fab in Blender  ·  "+a[3];Size=new Size(1320,850);MinimumSize=new Size(720,440);
         view.Dock=DockStyle.Fill;Controls.Add(view);
         browse=new FabBrowser(this, message=>view.CoreWebView2.PostWebMessageAsJson(json.Serialize(message)));
-        FormClosed+=(s,e)=>browse.Dispose();
+        FormClosed+=(s,e)=>{
+            timer.Dispose();
+            if(wakeup!=null)wakeup.Dispose();
+            browse.Dispose();parent.Dispose();
+        };
         Shown+=async(s,e)=>{
             try{
+                wakeup=new IpcWakeup(this,box,name=>name=="status.txt" ||
+                    (name.StartsWith("out-",StringComparison.Ordinal) && !name.EndsWith(".tmp",StringComparison.Ordinal)),Drain);
                 var profile=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"FabShelf","GalleryProfile");
                 if(a.Length>4)profile=a[4];
                 var env=await CoreWebView2Environment.CreateAsync(null,profile);
@@ -114,22 +121,25 @@ class Gallery : Form {
                     string path=Path.Combine(box,"ask-"+Guid.NewGuid().ToString("N"));
                     File.WriteAllText(path+".tmp",text);File.Move(path+".tmp",path);
                 };
-                core.NavigationCompleted+=(o,n)=>{ready=n.IsSuccess;};
+                core.NavigationCompleted+=(o,n)=>{ready=n.IsSuccess;if(ready)wakeup.Wake();};
                 view.Source=new Uri("https://library.invalid/index.html");
             }catch(Exception ex){MessageBox.Show(ex.Message,"Fab");Close();}
         };
         timer.Tick+=(s,e)=>{
             if(parent.HasExited||!Directory.Exists(box)){Close();return;}
-            if(!ready)return;
-            try{
-                foreach(string p in Directory.GetFiles(box,"out-*")){
-                    if(p.EndsWith(".tmp"))continue;
-                    view.CoreWebView2.PostWebMessageAsJson(File.ReadAllText(p));File.Delete(p);
-                }
-                string msg=Path.Combine(box,"status.txt");
-                if(File.Exists(msg)){view.CoreWebView2.PostWebMessageAsJson(json.Serialize(new{notice=File.ReadAllText(msg)}));File.Delete(msg);}
-            }catch(IOException){}
+            Drain();
         };timer.Start();
+    }
+    void Drain(){
+        if(!ready)return;
+        try{
+            foreach(string p in Directory.GetFiles(box,"out-*")){
+                if(p.EndsWith(".tmp",StringComparison.Ordinal))continue;
+                view.CoreWebView2.PostWebMessageAsJson(File.ReadAllText(p));File.Delete(p);
+            }
+            string msg=Path.Combine(box,"status.txt");
+            if(File.Exists(msg)){view.CoreWebView2.PostWebMessageAsJson(json.Serialize(new{notice=File.ReadAllText(msg)}));File.Delete(msg);}
+        }catch(IOException){}
     }
     [STAThread]static void Main(string[] a){Application.EnableVisualStyles();Application.Run(new Gallery(a));}
 }

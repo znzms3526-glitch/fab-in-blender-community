@@ -13,21 +13,26 @@ class Sync : Form {
     readonly JavaScriptSerializer json=new JavaScriptSerializer(){MaxJsonLength=16000000};
     readonly string dir, script;
     readonly Process parent;
-    bool ready, busy;
+    bool ready, busy, idleMetadata;
     string nonce, requestId;
     long deadline;
     ulong navigationId;
-    readonly Timer timer=new Timer(){Interval=180};
+    readonly Timer timer=new Timer(){Interval=150};
+    IpcWakeup wakeup;
     void Write(string file,string data){
         string tmp=file+".tmp";File.WriteAllText(tmp,data);
         if(File.Exists(file)) File.Replace(tmp,file,null);else File.Move(tmp,file);
     }
     void Complete(object result){
         try { Write(Path.Combine(dir,"reply"),json.Serialize(result)); }
-        finally { busy=false;nonce=null;requestId=null;deadline=0; }
+        finally { busy=false;idleMetadata=false;nonce=null;requestId=null;deadline=0; }
     }
     void Fail(string message){
         Complete(new{error=message,rid=requestId});
+    }
+    bool CancellationRequested(string rid){
+        Guid id;
+        return Guid.TryParseExact(rid,"N",out id) && File.Exists(Path.Combine(dir,"cancel-metadata-"+rid));
     }
     Sync(string[] args){
         dir=args[0];parent=Process.GetProcessById(int.Parse(args[1]));
@@ -37,6 +42,8 @@ class Sync : Form {
         web.Dock=DockStyle.Fill;Controls.Add(web);
         Shown+=async (s,e)=>{
             try{
+                wakeup=new IpcWakeup(this,dir,name=>name=="cmd" || name=="login" ||
+                    name.StartsWith("cancel-metadata-",StringComparison.Ordinal),Drain);
                 string mode=args.Length>2?args[2]:"system";
                 string proxy=args.Length>3?args[3]:"";
                 var env=await FabProfile.Create(mode,proxy,args.Length>4?args[4]:null);
@@ -53,17 +60,42 @@ class Sync : Form {
                     ready=false;navigationId=n.NavigationId;
                     if(busy && nonce!=null)Fail("Fab 登录页面已切换，请重试");
                 };
+                web.CoreWebView2.DOMContentLoaded+=(o,n)=>{
+                    if(n.NavigationId!=navigationId || web.Source==null ||
+                       web.Source.GetLeftPart(UriPartial.Authority)!="https://www.fab.com")return;
+                    ready=true;wakeup.Wake();
+                };
                 web.CoreWebView2.NavigationCompleted+=(o,n)=>{
                     if(n.NavigationId!=navigationId)return;
                     ready=true;
                     if(n.IsSuccess && web.Source.Host=="www.fab.com" && web.Source.AbsolutePath.TrimEnd('/')=="/library")Hide();
+                    wakeup.Wake();
                 };
                 web.Source=new Uri("https://www.fab.com/library");
                 Hide();
             }catch(Exception ex){Fail(ex.Message);}
         };
-        timer.Tick+=async(s,e)=>{
+        timer.Tick+=(s,e)=>{
             if(parent.HasExited||!Directory.Exists(dir)){Application.ExitThread();return;}
+            Drain();
+        };timer.Start();
+        FormClosing+=(s,e)=>{if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();}};
+        FormClosed+=(s,e)=>{
+            timer.Dispose();
+            if(wakeup!=null)wakeup.Dispose();
+            parent.Dispose();
+        };
+    }
+    async void Drain(){
+        if(IsDisposed||!Directory.Exists(dir))return;
+            if(busy && idleMetadata && CancellationRequested(requestId)){
+                string key=json.Serialize("__fabShelfMetadata_"+requestId);
+                Complete(new{deferred=true,rid=requestId});
+                // A late script reply carries the old nonce and cannot complete a foreground request.
+                try{await web.CoreWebView2.ExecuteScriptAsync("globalThis["+key+"]?.abort()");}
+                catch(Exception){}
+                return;
+            }
             if(busy && deadline!=0 && Stopwatch.GetTimestamp()>=deadline)
                 Fail("Fab 响应超时，请刷新或登录");
             if(!(busy && nonce==null) && File.Exists(Path.Combine(dir,"login"))){
@@ -76,8 +108,15 @@ class Sync : Form {
             string startedRequest=null;
             try{
                 string q=File.ReadAllText(file);var info=json.Deserialize<Dictionary<string,object>>(q);
-                if(!ready&&(string)info["op"]!="logout"){busy=false;return;}
-                File.Delete(file);requestId=info.ContainsKey("rid")?(string)info["rid"]:"";
+                string op=(string)info["op"],rid=info.ContainsKey("rid")?(string)info["rid"]:"";
+                object idle;
+                bool background=(op=="presence"||op=="taxonomy"||op=="detail") &&
+                    info.TryGetValue("idleMetadata",out idle) && true.Equals(idle);
+                if(background && CancellationRequested(rid)){
+                    File.Delete(file);Complete(new{deferred=true,rid=rid});return;
+                }
+                if(!ready&&op!="logout"){busy=false;return;}
+                File.Delete(file);requestId=rid;idleMetadata=background;
                 deadline=Stopwatch.GetTimestamp()+Stopwatch.Frequency*40;
                 startedRequest=requestId;
                 if((string)info["op"]=="logout"){
@@ -90,9 +129,12 @@ class Sync : Form {
                 }
                 if(web.Source==null || web.Source.GetLeftPart(UriPartial.Authority)!="https://www.fab.com"){
                     object allowSignedOut;
+                    object verifyAccount;
                     if((string)info["op"]=="account" && info.TryGetValue("allowSignedOut",out allowSignedOut) && true.Equals(allowSignedOut)){
                         Complete(new{uid="",rid=requestId});
                         if(!Visible)web.CoreWebView2.Navigate("https://www.fab.com/");
+                    }else if((string)info["op"]=="library" && info.TryGetValue("verifyAccount",out verifyAccount) && true.Equals(verifyAccount)){
+                        Complete(new{observedAccount="",rid=requestId});
                     }else Fail("请先登录 Fab");
                     return;
                 }
@@ -102,8 +144,6 @@ class Sync : Form {
             }catch(Exception ex){
                 if(startedRequest==null || requestId==startedRequest)Fail(ex.Message);
             }
-        };timer.Start();
-        FormClosing+=(s,e)=>{if(e.CloseReason==CloseReason.UserClosing){e.Cancel=true;Hide();}};
     }
     [STAThread] static void Main(string[] a){Application.EnableVisualStyles();Application.Run(new Sync(a));}
 }

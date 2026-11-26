@@ -65,6 +65,30 @@ with tempfile.TemporaryDirectory(prefix="fab-library-session-") as folder:
         signed_out = service.handle(query)
         assert not signed_out["signedIn"] and not signed_out["items"]
 
+        # Startup on a saved filter caches a page before the first default head check.
+        current = "a"
+        newest = None
+        filtered = dict(query, cursor="", kind="material", query="saved filter")
+        first_filtered = service.handle(filtered)
+        assert service.page_cache and service.library_head is None
+        observed = service.handle(status)
+        assert service.library_head == ("a",)
+        assert observed["libraryContentRevision"] == first_filtered["libraryContentRevision"]
+        assert service.page_cache, "Establishing the first head invalidated the filtered page"
+
+        service.clear_online_caches()
+        first_filtered = service.handle(filtered)
+        newest = dict(uid="confirmed-item", title="Confirmed acquisition", kind="material")
+        service.mark_library_dirty("a", [newest["uid"]], first_filtered["libraryRevision"])
+        observed = service.handle(status)
+        assert observed["libraryContentRevision"] == first_filtered["libraryContentRevision"] + 1
+        assert not service.library_pending
+
+        assert service.handle({"op": "cacheStats"})["limitMiB"] == 512
+        service.save_settings(dict(values=dict(service.settings, coverMiB=128)))
+        assert service.handle({"op": "cacheStats"})["limitMiB"] == 128
+
+        service.clear_online_caches()
         clock = [1000.0]
         visible = ["already-owned"]
         injected = []

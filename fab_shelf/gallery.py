@@ -1,4 +1,5 @@
 """Fab gallery controller. All network and file operations run outside Blender's UI thread."""
+from collections import OrderedDict
 import hashlib
 import tempfile
 from zipfile import BadZipFile
@@ -13,13 +14,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import Request, getproxies, proxy_bypass, urlopen
+from urllib.request import Request
 
-from . import bl_info, catalog, scene, network, asset_library, bridge, storage
+from . import bl_info, catalog, scene, network, asset_library, bridge, storage, cover_http
 from .free_task import FreeTask, retry_after_seconds
 
 
 CACHE_SWITCH_MESSAGE = "正在切换下载库，请待当前任务完成后重试"
+LIBRARY_SNAPSHOT_TTL = 24 * 60 * 60
+LIBRARY_SNAPSHOT_ITEMS = 96
+LIBRARY_SNAPSHOT_BYTES = 512 * 1024
+LIBRARY_SNAPSHOT_ACCOUNTS = 8
+PACKAGE_DIMENSION_CACHE_LIMIT = 512
 CACHE_WRITES = {
     "addNativeAsset", "bridgeCancel", "bridgeImport", "bridgePublish", "bridgeRemove", "bridgeScan",
     "clearCovers", "clearJobs", "control", "deleteLocal", "favorite", "freeInfo", "freePause", "freeStart",
@@ -83,13 +89,7 @@ def listing_uid(value):
         raise ValueError("请粘贴有效的 Fab 商品链接") from None
 
 
-def route(url):
-    host=urlsplit(url).hostname
-    proxy=getproxies().get("https")
-    if proxy and not proxy_bypass(host):
-        addr=urlsplit(proxy if "://" in proxy else "http://"+proxy)
-        return "代理 "+str(addr.hostname)+(f":{addr.port}" if addr.port else "")
-    return "直连（应用层）"
+urlopen=network.opener("system","")
 
 
 class Gallery:
@@ -101,6 +101,7 @@ class Gallery:
         self.manage_auth=manage_auth
         self.auth=None
         self.last_error=""
+        self.file_route_target=network.API_PROBE
         self.settings_lock=threading.Lock()
         self.logged_out=False
         self.project_state=dict(saved=True,waiting=0)
@@ -116,6 +117,8 @@ class Gallery:
         self.bridge=bridge.BridgeLibrary(cache,self.stop)
         self.lock=threading.RLock()
         self.api_lock=threading.Lock()
+        self.foreground_requests=0
+        self.metadata_rid=None
         self.library_session_lock=threading.Lock()
         self.library_account=None
         self.library_revision=0
@@ -148,13 +151,16 @@ class Gallery:
         self.formats={}
         self.local={}
         self.local_by_asset={}
+        self.package_dimensions=OrderedDict()
         self.record_stamp=None
         self.record_versions={}
-        self.cover_pool=ThreadPoolExecutor(max_workers=3,thread_name_prefix="FabCover")
+        self.cover_pool=ThreadPoolExecutor(max_workers=6,thread_name_prefix="FabCover")
         self.cover_pending=set()
         self.latest_page=None
         self.view_generations={}
         self.page_cache={}
+        self.local_feed_indices={}
+        self.page_prefetches=set()
         self.pins=cache/"favorites"
         self.pins.mkdir(parents=True,exist_ok=True)
         self.preview_budget=self.settings["coverMiB"]*1024*1024
@@ -179,7 +185,7 @@ class Gallery:
         if sys.platform=="darwin" and new["apiRoute"]=="direct":raise ValueError("macOS 登录线路请选跟随系统或指定代理；文件下载可选直连")
         if self.request_cache_change(q.get("cache", self.cache), settings=new):
             return self.settings_info()
-        with self.api_lock:
+        with self.library_session_lock, self.api_lock:
             old=self.settings
             switched=old["apiRoute"]!=new["apiRoute"] or (new["apiRoute"]=="proxy" and new["proxy"]!=old["proxy"])
             try:
@@ -200,11 +206,15 @@ class Gallery:
                     self.online_revision+=1
         return self.settings_info()
 
-    def settings_info(self):
+    def settings_info(self,resolve_network=False):
         s=self.settings
-        return dict(values=s,defaults=network.DEFAULTS,systemProxy=network.system_proxy(),
-                    apiLabel=network.LABELS[s["apiRoute"]]+(" · "+s["proxy"] if s["apiRoute"]=="proxy" else ""),
-                    fileLabel=network.label(s["fileRoute"],s["proxy"]),
+        target=self.file_route_target
+        system=network.label("system","",target) if resolve_network else ""
+        file_label=system if s["fileRoute"]=="system" and system else network.label(
+            s["fileRoute"],s["proxy"],target if resolve_network and s["fileRoute"]=="auto" else None)
+        return dict(values=s,defaults=network.DEFAULTS,systemLabel=system,routeHost=urlsplit(target).hostname,
+                    apiLabel=network.label(s["apiRoute"],s["proxy"]),
+                    fileLabel=file_label,
                     connection=self.connection,taskState="运行中" if self.claims.running else "空闲",defaultCache=str(Path.home()/"FabShelfCache"),
                     lastError=self.last_error,lastTest=self.last_test,
                     version=".".join(map(str,bl_info["version"])),**self.cache_path_info())
@@ -240,11 +250,14 @@ class Gallery:
                     self.persist(job)
             return uid,self.library_revision
 
-    def library_session(self, request_id=None, *, automatic=False):
+    def library_session(self, request_id=None, *, automatic=False, if_idle=False):
         # Serialize observations so that an older response cannot restore a previous account.
-        with self.library_session_lock:
+        if not self.library_session_lock.acquire(blocking=not if_idle):
+            return "",None
+        try:
             query=dict(op="account",allowSignedOut=True)
             if automatic:query["_automaticLibrary"]=True
+            if if_idle:query["_ifIdle"]=True
             account=self.api(query,request_id)
             if account is None:return "",None
             uid=account.get("uid")
@@ -253,6 +266,76 @@ class Gallery:
             if uid:
                 self.logged_out=False
             return self.remember_library_account(uid)
+        finally:
+            self.library_session_lock.release()
+
+    def read_library_snapshot(self, account, *, revision=None):
+        with self.lock:
+            if not account or account != self.library_account or self.logged_out:
+                return None
+            session = self.library_revision
+            if revision is not None and revision != session:
+                return None
+        key = hashlib.sha256(account.encode()).hexdigest()
+        path = storage.fs_path(self.cache / "library-snapshots" / (key + ".json"))
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(LIBRARY_SNAPSHOT_BYTES + 1)
+            if len(raw) > LIBRARY_SNAPSHOT_BYTES:
+                return None
+            saved = json.loads(raw)
+            if saved["account"] != key or not 0 <= time.time() - saved["fetchedAt"] <= LIBRARY_SNAPSHOT_TTL:
+                return None
+            items = saved["items"]
+            if not isinstance(items, list) or len(items) > LIBRARY_SNAPSHOT_ITEMS:
+                return None
+            cards = []
+            for row in items:
+                uid, title, kind = (row[field] for field in ("uid", "title", "kind"))
+                if not all(isinstance(value, str) for value in (uid, title, kind)) or not uid:
+                    return None
+                name = hashlib.sha256(uid.encode()).hexdigest() + ".img"
+                preview = storage.fs_path(self.cache / "previews" / name)
+                thumb = "https://covers.invalid/" + name if preview.is_file() else ""
+                cards.append(dict(uid=uid, title=title, kind=kind, thumb=thumb, local=[],
+                                  localOnly=False, discovery=False, favorite=False))
+        except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            return None
+        with self.lock:
+            if session == self.library_revision and not self.logged_out:
+                return dict(items=cards)
+
+    def write_library_snapshot(self, account, data, *, revision=None, content_revision=None):
+        # Store only the public card labels. Every download, cover URL and cursor is resolved live.
+        items = []
+        seen = set()
+        for row in data["items"]:
+            if len(items) == LIBRARY_SNAPSHOT_ITEMS:
+                break
+            uid, title, kind = (row.get(field, "") for field in ("uid", "title", "kind"))
+            if not all(isinstance(value, str) for value in (uid, title, kind)) or not uid or len(uid) > 128:
+                continue
+            if uid not in seen:
+                items.append(dict(uid=uid, title=(title or uid)[:512], kind=kind[:64]))
+                seen.add(uid)
+        with self.lock:
+            if (not account or account != self.library_account or self.logged_out or self.cache_switching
+                    or self.cache_change is not None or self.stop.is_set()
+                    or revision not in (None, self.library_revision)
+                    or content_revision not in (None, self.library_content_revision)):
+                return
+            key = hashlib.sha256(account.encode()).hexdigest()
+            directory = storage.fs_path(self.cache / "library-snapshots")
+            path = directory / (key + ".json")
+            try:
+                catalog.atomic_json(path, dict(account=key, fetchedAt=time.time(), items=items))
+                other = [(file.stat().st_mtime_ns, file) for file in directory.glob("*.json")
+                         if file != path and re.fullmatch(r"[a-f0-9]{64}", file.stem)]
+                for _, file in sorted(other, reverse=True)[LIBRARY_SNAPSHOT_ACCOUNTS - 1:]:
+                    file.unlink(missing_ok=True)
+            except OSError:
+                # Storage availability cannot block a live library page.
+                pass
 
     def library_stamp(self, data):
         return tuple(sorted(item["uid"] for item in data["items"] if item.get("uid")))
@@ -272,8 +355,7 @@ class Gallery:
             if data is not None:
                 head=self.library_stamp(data)
                 if head or not data["next"]:
-                    has_cached_view=any(key[0]=="library" for key,_ in self.page_cache)
-                    if head!=self.library_head and (self.library_head is not None or has_cached_view):
+                    if head!=self.library_head and (self.library_head is not None or bool(self.library_pending)):
                         self.library_content_revision+=1
                         self.page_cache={key:value for key,value in self.page_cache.items()
                                          if key[0][0]!="library"}
@@ -298,9 +380,9 @@ class Gallery:
                     delay=(24,45)[self.library_sync_attempts-1]
                     self.library_next_check=time.monotonic()+delay
 
-    def library_status(self):
+    def library_status(self, *, defer_if_busy=False):
         try:
-            account, revision = self.library_session(automatic=True)
+            account, revision = self.library_session(automatic=True,if_idle=defer_if_busy)
         except ValueError as exc:
             if retry_after_seconds(exc) is None:raise
             account, revision = "",None
@@ -316,7 +398,8 @@ class Gallery:
                 generation=self.library_claim_generation
         if check:
             try:
-                data = self.api(dict(op="library",kind="ALL",cursor="",account=account,_automaticLibrary=True))
+                data = self.api(dict(op="library",kind="ALL",cursor="",account=account,
+                                     _automaticLibrary=True,_ifIdle=defer_if_busy))
             except ValueError as exc:
                 self.finish_library_check(revision,generation,None)
                 deferred=retry_after_seconds(exc) is not None
@@ -501,9 +584,28 @@ class Gallery:
         for lease in self.leases.values():lease.close()
         self.leases.clear()
     def texture_dimensions(self,record):
-        if "textureDimensions" not in record:
-            record["textureDimensions"]=catalog.texture_dimensions(self.cache/"packages"/record["hash"], record["name"])
-        return record["textureDimensions"]
+        digest, name = record["hash"], record["name"]
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            return {}
+        blob = storage.fs_path(self.cache / "packages" / digest)
+        fingerprint = catalog.package_fingerprint(blob)
+        if fingerprint is None:
+            return {}
+        key = (digest, ".zip" if name.lower().endswith(".zip") else name)
+        with self.lock:
+            cached = self.package_dimensions.get(key)
+            if cached is not None and cached[0] == fingerprint:
+                self.package_dimensions.move_to_end(key)
+                return cached[1]
+        dimensions = catalog.cached_package_dimensions(self.cache, blob, digest, name, fingerprint)
+        if dimensions is None:
+            return {}
+        with self.lock:
+            self.package_dimensions[key] = (fingerprint, dimensions)
+            self.package_dimensions.move_to_end(key)
+            if len(self.package_dimensions) > PACKAGE_DIMENSION_CACHE_LIMIT:
+                self.package_dimensions.popitem(last=False)
+        return dimensions
 
     def record_local(self, record):
         digest=record["hash"]
@@ -544,6 +646,24 @@ class Gallery:
         if source == "file":
             return [row for row in rows if not row.get("uid")]
         return rows + list(self.bridge.cards(bridge_index).values())
+
+    def local_feed_card(self,q):
+        if q.get("source") not in {"all","fab"}:
+            return None
+        with self.lock:
+            copies=self.local_by_asset.get(q["uid"],{})
+            row=next(reversed(copies.values()),None)
+        if row is None or not row.get("uid"):
+            return None
+        if q.get("kind","ALL") not in {"ALL",row.get("kind")}:
+            return None
+        if q.get("query","").strip().casefold() not in (row.get("title","")+" "+row.get("name","")).casefold():
+            return None
+        if category:=q.get("category",""):
+            actual=self.category(row)
+            if actual!=category and not actual.startswith(category+"--"):
+                return None
+        return self.card(row)
 
     def selected_copy(self,q):
         with self.lock:
@@ -634,11 +754,27 @@ class Gallery:
         self.wait_initial_scan()
         self.scan(force)
 
-    def api(self,q,request_id=None):
-        with self.api_lock:
+    @contextmanager
+    def api_slot(self,prefetch):
+        if not prefetch:
+            with self.api_lock:
+                yield True
+            return
+        acquired=self.api_lock.acquire(blocking=False)
+        try:
+            yield acquired
+        finally:
+            if acquired:self.api_lock.release()
+
+    def api(self,q,request_id=None,*,prefetch=False):
+        metadata=q.get("_idleMetadata") is True and q.get("op") in {"presence","taxonomy","detail"}
+        with self.api_slot(prefetch or metadata or q.get("_ifIdle")) as acquired:
+            if not acquired:return None
             if self.stop.is_set():raise ValueError("窗口已关闭")
             remaining=max(self.fab_retry_until-time.monotonic(),
                           self.claims.info.get("retryAt",0)-time.time())
+            if (prefetch or metadata) and (remaining>0 or self.claims.running or self.library_check_active):
+                return None
             if remaining>0:
                 if q.get("_automaticLibrary"):return None
                 if q.get("op") in {"freePage","ownedBatch","checkFree","submitFree"}:
@@ -651,32 +787,54 @@ class Gallery:
             token=uuid.uuid4().hex
             request=dict(q,rid=token)
             request.pop("_automaticLibrary",None)
-            catalog.atomic_json(self.box/"cmd",request)
-            deadline=time.monotonic()+50
-            while not self.stop.wait(.06):
-                p=self.box/"reply"
-                if p.exists():
-                    r=json.loads(p.read_text(encoding="utf-8-sig"));p.unlink()
-                    if r.get("rid")!=token:continue
-                    error=r.get("error")
-                    if q.get("op")=="submitFree" and r.get("status") in {"rejected","beforeSubmitError"}:
-                        error=r.get("message",error)
-                    if delay:=retry_after_seconds(error):
-                        self.fab_retry_until=max(self.fab_retry_until,time.monotonic()+delay)
-                    if r.get("error"):
-                        if any(s in str(r["error"]) for s in ("登录","401","403")):self.connection="需重新验证"
-                        raise ValueError(r["error"])
-                    if session_probe:self.connection="已连接" if r.get("uid") else "需重新验证"
-                    elif q.get("op") in ("account","library","ownedBatch","listingAccess"):self.connection="已连接"
-                    return r
-                if time.monotonic()>deadline:raise ValueError("Fab 响应超时，请刷新或登录")
-            raise ValueError("窗口已关闭")
+            request.pop("_ifIdle",None)
+            request.pop("_idleMetadata",None)
+            if metadata:
+                request["idleMetadata"]=True
+                # Publish the mailbox and the cancelable request ID together.
+                with self.lock:
+                    if self.foreground_requests:return None
+                    catalog.atomic_json(self.box/"cmd",request)
+                    self.metadata_rid=token
+            else:
+                catalog.atomic_json(self.box/"cmd",request)
+            try:
+                started=time.monotonic()
+                deadline=started+50
+                while not self.stop.wait(.015 if time.monotonic()-started<1 else .05):
+                    p=self.box/"reply"
+                    if p.exists():
+                        r=json.loads(p.read_text(encoding="utf-8-sig"));p.unlink()
+                        if r.get("rid")!=token:continue
+                        if metadata and r.get("deferred") is True:return None
+                        error=r.get("error")
+                        if q.get("op")=="submitFree" and r.get("status") in {"rejected","beforeSubmitError"}:
+                            error=r.get("message",error)
+                        if delay:=retry_after_seconds(error):
+                            self.fab_retry_until=max(self.fab_retry_until,time.monotonic()+delay)
+                        if r.get("error"):
+                            if any(s in str(r["error"]) for s in ("登录","401","403")):self.connection="需重新验证"
+                            raise ValueError(r["error"])
+                        if session_probe:self.connection="已连接" if r.get("uid") else "需重新验证"
+                        elif q.get("verifyAccount"):self.connection="已连接" if r.get("observedAccount") else "需重新验证"
+                        elif q.get("op") in ("account","library","ownedBatch","listingAccess"):self.connection="已连接"
+                        return r
+                    if time.monotonic()>deadline:raise ValueError("Fab 响应超时，请刷新或登录")
+                raise ValueError("窗口已关闭")
+            finally:
+                if metadata:
+                    with self.lock:
+                        self.metadata_rid=None
+                        (self.box/("cancel-metadata-"+token)).unlink(missing_ok=True)
 
     def loop(self):
-        while not self.stop.wait(.12):
+        delay=.04
+        while not self.stop.wait(delay):
             try:
+                delay=.04
                 for p in sorted(self.box.glob("ask-*"),key=lambda p:p.stat().st_mtime_ns):
                     if p.suffix==".tmp":continue
+                    delay=.015
                     q=json.loads(p.read_text(encoding="utf-8-sig"));p.unlink()
                     if q.get("op")=="page":
                         session=q.get("viewSession","")
@@ -698,6 +856,14 @@ class Gallery:
     def _dispatch_request(self,q):
         q = self.project_request(q)
         op = q.get("op")
+        priority = op in {"page", "login", "logout", "freeStart", "saveSettings"}
+        future = None
+        if priority:
+            with self.lock:
+                self.foreground_requests += 1
+                if os.name=="nt" and self.metadata_rid:
+                    try:(self.box/("cancel-metadata-"+self.metadata_rid)).touch()
+                    except OSError:pass
         try:
             if op == "jobs":
                 self.reply(q)
@@ -708,11 +874,19 @@ class Gallery:
                 self._admit_cache_write(can_stop_work=can_stop)
                 self._run_cache_write(self.reply, (q,))
             elif op in CACHE_WRITES:
-                self.submit_cache_write(self.reply,q)
+                future=self.submit_cache_write(self.reply,q)
             else:
-                self.pool.submit(self.reply,q)
+                future=self.pool.submit(self.reply,q)
         except ValueError as e:
             self._reply(q,error=str(e))
+        finally:
+            if priority:
+                if future is None:self._finish_foreground()
+                else:future.add_done_callback(self._finish_foreground)
+
+    def _finish_foreground(self, _future=None):
+        with self.lock:
+            self.foreground_requests -= 1
 
     def _reply(self,q,**out):
         if not self.stop.is_set() and self.box.exists():
@@ -723,21 +897,37 @@ class Gallery:
         except Exception as e:
             self.last_error=q.get("op","")+" · "+type(e).__name__
             out=dict(error=str(e))
-        self._reply(q,**out)
+        identity=q.get("_libraryPageIdentity")
+        presence=q.get("_presenceIdentity")
+        if identity is None and presence is None:
+            self._reply(q,**out)
+        else:
+            with self.lock:
+                if identity is not None:
+                    try:self.check_library_page(q,*identity)
+                    except ValueError as error:out=dict(error=str(error))
+                elif presence!=(self.library_revision,self.library_content_revision,self.online_revision):
+                    out=dict(result=dict(deferred=True))
+                self._reply(q,**out)
+        prefetch=q.get("_page_prefetch")
+        if prefetch and "result" in out and not self.stop.is_set():
+            self.pool.submit(self.prefetch_page,q,*prefetch)
         if q.get("op")=="settings" and "error" not in out:
             self.window_ready.set()
 
     def metadata_path(self,uid):
         return self.cache/"listing-categories"/(hashlib.sha256(uid.encode()).hexdigest()+".json")
 
-    def category(self,r):
+    def category(self,r,*,idle=False):
         if r.get("bridge"):return ""
         if r.get("category"):return r["category"]
         uid=r.get("uid")
         if not uid:return ""
         path=self.metadata_path(uid)
         if path.exists():return json.loads(path.read_text(encoding="utf8"))
-        value=self.api(dict(op="detail",uid=uid)).get("category","")
+        result=self.api(dict(op="detail",uid=uid,_idleMetadata=idle))
+        if result is None:return None
+        value=result.get("category","")
         catalog.atomic_json(path,value)
         return value
 
@@ -752,12 +942,13 @@ class Gallery:
         else:path.unlink(missing_ok=True)
         return on
 
-    def taxonomy(self):
+    def taxonomy(self,*,idle=False):
         path=self.cache/"fab-taxonomy.json"
         if path.exists() and time.time()-path.stat().st_mtime<86400:
             return json.loads(path.read_text(encoding="utf8"))
         try:
-            data=self.api(dict(op="taxonomy"))
+            data=self.api(dict(op="taxonomy",_idleMetadata=idle))
+            if data is None:return dict(deferred=True)
             if not isinstance(data.get("tree"),dict):raise ValueError("Fab 分类格式已改变")
             catalog.atomic_json(path,data)
             return data
@@ -781,7 +972,9 @@ class Gallery:
             if not record.get("thumb") and not record.get("hash"):
                 with self.lock:
                     record=next(iter(self.local_by_asset.get(uid,{}).values()),record)
-            path=catalog.thumbnail(self.cache,uid,record,network.opener(self.settings["fileRoute"],self.settings["proxy"]))
+            settings=self.settings
+            path=catalog.thumbnail(self.cache,uid,record,
+                lambda url:cover_http.download(url,settings["fileRoute"],settings["proxy"]))
             if path and time.monotonic()-self.last_trim>30:
                 with self.lock:
                     self.last_trim=time.monotonic()
@@ -828,6 +1021,8 @@ class Gallery:
         return {hashlib.sha256(uid.encode()).hexdigest() + ".img" for uid in uids}
 
     def page(self,q):
+        if "cursor" in q:
+            return self.stream_page(q)
         terms=q.get("query","").strip();kind=q.get("kind","ALL");page=max(1,min(2000,int(q.get("page",1))))
         category=q.get("category","")
         if q.get("scope") in {"local","favorites"}:
@@ -891,6 +1086,218 @@ class Gallery:
         if is_library and content_revision!=self.library_content_revision:
             raise ValueError("Fab 素材库已更新，请重新加载")
         return dict(items=cards,**info,**session)
+
+    def check_page_request(self,q):
+        if q.get("id") and q["id"]!=self.latest_page:
+            raise ValueError("搜索已更新")
+
+    def stream_local_page(self,q,cursor,kind,terms,category):
+        scope=q["scope"]
+        source=q.get("source","all")
+        offset=int(cursor or "0")
+        prefix=(q.get("viewSession",""),q.get("generation",0),scope,source,kind,terms,category)
+        with self.lock:
+            index=self.local_feed_indices.get(prefix) if offset else None
+        if index is None:
+            if source!="bridge" or scope=="favorites":
+                self.refresh_local(force=q.get("refresh",False))
+            bridge_index=self.bridge.snapshot() if scope=="favorites" or source in {"all","bridge"} else None
+            grouped={}
+            terms=terms.casefold()
+            for row in self.local_rows(scope,source,bridge_index):
+                if kind!="ALL" and row.get("kind")!=kind:
+                    continue
+                if terms not in (row.get("title","")+" "+row.get("name","")).casefold():
+                    continue
+                uid=row.get("key") or row.get("uid") or row["hash"]
+                grouped[uid]=row
+            if category:
+                for uid,row in list(grouped.items()):
+                    self.check_page_request(q)
+                    actual=self.category(row)
+                    if actual!=category and not actual.startswith(category+"--"):
+                        del grouped[uid]
+            index=(sorted(grouped.values(),key=lambda r:(r.get("title") or r["name"],r.get("key") or r.get("uid") or r["hash"])),
+                   bridge_index["revision"] if bridge_index is not None else None)
+            with self.lock:
+                self.check_page_request(q)
+                if len(self.local_feed_indices)>=4:
+                    self.local_feed_indices.pop(next(iter(self.local_feed_indices)))
+                self.local_feed_indices[prefix]=index
+        rows,bridge_revision=index
+        cards=[self.card(r) for r in rows[offset:offset+36]]
+        self.check_page_request(q)
+        next_cursor=str(offset+36) if offset+36<len(rows) else ""
+        return dict(items=cards,nextCursor=next_cursor,more=bool(next_cursor),bridgeRevision=bridge_revision)
+
+    def stream_page(self,q):
+        self.check_page_request(q)
+        cursor=q["cursor"]
+        if not isinstance(cursor,str):
+            raise ValueError("资产列表游标无效")
+        terms=q.get("query","").strip()
+        kind=q.get("kind","ALL")
+        category=q.get("category","")
+        if q.get("scope") in {"local","favorites"}:
+            if cursor and not re.fullmatch(r"[0-9]{1,9}",cursor):
+                raise ValueError("资产列表游标无效")
+            return self.stream_local_page(q,cursor,kind,terms,category)
+        is_library=q.get("scope")!="discover"
+        op="library" if is_library else "discover"
+        session={}
+        revision=content_revision=None
+        lookahead=q.get("lookahead") is True and is_library and bool(cursor)
+        bound_continuation=is_library and bool(cursor) and q.get("libraryRevision") is not None
+        default_library=is_library and kind=="ALL" and not terms and not category
+        request=dict(op=op,kind=kind,query=terms,category=category,cursor=cursor)
+        if lookahead and self.claims.running:
+            return dict(deferred=True)
+        if is_library:
+            if bound_continuation:
+                with self.lock:
+                    account,revision=self.library_account,self.library_revision
+                if not account or self.logged_out:
+                    raise ValueError("Fab 账号正在切换")
+            else:
+                account,revision=self.library_session(q.get("id"),if_idle=lookahead)
+                if lookahead and revision is None:return dict(deferred=True)
+            with self.lock:
+                content_revision=self.library_content_revision
+                online_revision=self.online_revision
+            session=dict(libraryRevision=revision,libraryContentRevision=content_revision,signedIn=bool(account))
+            if not account:
+                return dict(items=[],nextCursor="",more=False,**session)
+            if cursor and q.get("libraryRevision") not in (None,revision):
+                raise ValueError("Fab 账号正在切换")
+            if cursor and q.get("libraryContentRevision") not in (None,content_revision):
+                raise ValueError("Fab 素材库已更新，请重新加载")
+            request["account"]=account
+            if default_library and not cursor and not q.get("refresh") and q.get("wantPreview"):
+                snapshot=self.read_library_snapshot(account,revision=revision)
+                if snapshot and snapshot["items"]:
+                    with self.lock:
+                        self.check_library_page(q,revision,content_revision,online_revision)
+                        self._reply(q,preview=dict(items=snapshot["items"],**session))
+
+        key=(op,revision,kind,terms,category)
+        with self.lock:
+            stamp=self.page_cache.get((key,cursor))
+        cache_hit=bool(stamp and not q.get("refresh") and time.monotonic()-stamp[0]<180)
+        if cache_hit:
+            if bound_continuation:
+                verified,current=self.library_session(q.get("id"),if_idle=lookahead)
+                if lookahead and current is None:return dict(deferred=True)
+                if verified!=account or current!=revision:raise ValueError("Fab 账号正在切换")
+            data=stamp[1]
+        elif bound_continuation:
+            data=self.fetch_bound_library_page(q,request,revision,content_revision,online_revision,lookahead)
+            if data is None:return dict(deferred=True)
+        else:
+            data=self.api(request,q.get("id"))
+        next_cursor=data["next"] or ""
+        if next_cursor==cursor:
+            next_cursor=""
+        cards=[self.card(row) for row in data["items"]]
+        with self.lock:
+            self.check_page_request(q)
+            if is_library:
+                self.check_library_page(q,revision,content_revision,online_revision)
+                q["_libraryPageIdentity"]=(revision,content_revision,online_revision)
+            if default_library and not cursor and self.library_head is None:
+                head=self.library_stamp(data)
+                if head or not next_cursor:
+                    self.library_head=head
+                    self.library_head_checked=time.monotonic()
+            if not cache_hit:self.cache_stream_page(key,cursor,data)
+        if default_library and not cache_hit:
+            self.save_cached_library_snapshot(key,cursor,account,content_revision,online_revision)
+        if is_library and next_cursor and q.get("prefetch"):
+            q["_page_prefetch"]=(key,dict(request,cursor=next_cursor),content_revision,online_revision)
+        return dict(items=cards,nextCursor=next_cursor,more=bool(next_cursor),**session)
+
+    def check_library_page(self,q,revision,content_revision,online_revision):
+        self.check_page_request(q)
+        if revision!=self.library_revision or online_revision!=self.online_revision:
+            raise ValueError("Fab 账号正在切换")
+        if content_revision!=self.library_content_revision:
+            raise ValueError("Fab 素材库已更新，请重新加载")
+
+    def fetch_bound_library_page(self,q,request,revision,content_revision,online_revision,lookahead):
+        # The WebView verifies the expected account before and after fetching. Commit an
+        # observed switch in the same order as ordinary account observations and logout.
+        if not self.library_session_lock.acquire(blocking=not lookahead):
+            return None
+        try:
+            with self.lock:
+                self.check_library_page(q,revision,content_revision,online_revision)
+            data=self.api(dict(request,verifyAccount=True,lookahead=lookahead),q.get("id"),prefetch=lookahead)
+            if data is None:return None
+            observed=data.get("observedAccount")
+            if not isinstance(observed,str):raise ValueError("Fab 响应格式异常，请稍后重试")
+            if observed!=request["account"]:
+                self.remember_library_account(observed)
+                raise ValueError("Fab 账号正在切换")
+            return data
+        finally:
+            self.library_session_lock.release()
+
+    def cache_stream_page(self,key,cursor,data):
+        if len(self.page_cache)>=48 and (key,cursor) not in self.page_cache:
+            self.page_cache.pop(next(iter(self.page_cache)))
+        self.page_cache[(key,cursor)]=(time.monotonic(),data,None)
+
+    def save_cached_library_snapshot(self,key,published_cursor,account,content_revision,online_revision):
+        with self.lock:
+            if (key != ("library", self.library_revision, "ALL", "", "") or account != self.library_account
+                    or content_revision != self.library_content_revision or online_revision != self.online_revision):
+                return
+            head = self.page_cache.get((key, ""))
+            if head is None:
+                return
+            now = time.monotonic()
+            cursor = ""
+            visited = set()
+            items = []
+            # Persist only the contiguous prefix from current, already-fetched cursors.
+            for _ in range(3):
+                stamp = self.page_cache.get((key, cursor))
+                if stamp is None or now - stamp[0] >= 180 or stamp[0] < head[0] or cursor in visited:
+                    break
+                visited.add(cursor)
+                data = stamp[1]
+                items.extend(data["items"])
+                cursor = data["next"]
+                if not isinstance(cursor, str) or not cursor:
+                    break
+            if published_cursor in visited:
+                self.write_library_snapshot(account, dict(items=items), revision=key[1],
+                                            content_revision=content_revision)
+
+    def prefetch_page(self,q,key,request,content_revision,online_revision):
+        cursor=request["cursor"]
+        cache_key=(key,cursor)
+        def same_view():
+            return (self.view_generations.get(q.get("viewSession",""),0)==q.get("generation",0)
+                    and request["account"]==self.library_account and key[1]==self.library_revision
+                    and content_revision==self.library_content_revision and online_revision==self.online_revision)
+        with self.lock:
+            cached=self.page_cache.get(cache_key)
+            if (not same_view() or q.get("id")!=self.latest_page or self.page_prefetches
+                    or (cached and time.monotonic()-cached[0]<180) or self.claims.running):
+                return
+            self.page_prefetches.add(cache_key)
+        try:
+            data=self.api(request,q.get("id"),prefetch=True)
+            if data is not None:
+                with self.lock:
+                    if same_view():
+                        self.cache_stream_page(key,cursor,data)
+                        self.save_cached_library_snapshot(key,cursor,request["account"],content_revision,online_revision)
+        except (ValueError,OSError):
+            pass
+        finally:
+            with self.lock:
+                self.page_prefetches.discard(cache_key)
 
     def options(self,uid,*,refresh=False):
         if refresh or uid not in self.formats:
@@ -1415,11 +1822,17 @@ class Gallery:
         settings=self.settings
         j["route"]=network.label(settings["fileRoute"],settings["proxy"])
         send=urlopen if settings["fileRoute"]=="system" else network.opener(settings["fileRoute"],settings["proxy"])
+        self.file_route_target=network.origin_url(link)
         start=time.monotonic()
         request=Request(link,headers=headers)
-        with send(request,timeout=25) as res:
-            if settings["fileRoute"]=="system" and res.geturl()==link and not request.has_proxy() and request.host==urlsplit(link).netloc:
-                j["route"]="跟随系统 · 直连（应用层）"
+        try:
+            response=send(request,timeout=25)
+        finally:
+            if actual:=getattr(request,"fab_route",None):j["route"]=actual.label
+        with response as res:
+            if actual:=getattr(res,"fab_route",None):
+                j["route"]=actual.label
+                self.file_route_target=network.origin_url(res.geturl())
             if res.status==206:
                 if not res.headers.get("Content-Range","").startswith(f"bytes {offset}-"):raise IOError("续传位置不符，请重试")
             else:offset=0
@@ -1516,6 +1929,10 @@ class Gallery:
             favorite = self.favorite_path(digest) if not uid else None
             removed_blob = catalog.delete_package_record(self.cache, digest, uid, favorite)
             self.forget_local(asset_key, digest)
+            if removed_blob:
+                for key in tuple(self.package_dimensions):
+                    if key[0] == digest:
+                        self.package_dimensions.pop(key)
             if not uid:
                 self.assets.pop(digest, None)
             self.record_stamp = None
@@ -1550,7 +1967,7 @@ class Gallery:
             return self.import_notice()
         if op in {"get","members","send","pick","cacheStats","clearCovers","addNativeAsset","deleteLocal"} or (op=="presence" and q["scope"]=="local"):
             self.wait_initial_scan()
-        if op=="settings":return self.settings_info()
+        if op=="settings":return self.settings_info(resolve_network=q.get("network") is True)
         if op=="saveSettings":
             with self.settings_lock:return self.save_settings(q)
         if op=="speedTest":return self.speed_test(q.get("proxy",""))
@@ -1570,24 +1987,38 @@ class Gallery:
         if op=="refreshFacets":self.facets.clear();return True
         if op=="presence":
             scope=q["scope"];kind=q.get("kind","");values=q["values"]
+            idle=q.get("idle") is True
             if scope=="owned":
+                if idle and (not isinstance(values,list) or len(values)>3 or not all(isinstance(v,str) for v in values)):
+                    raise ValueError("分类查询格式无效")
                 with self.lock:
                     revision=self.library_revision
                     content_revision=self.library_content_revision
+                    online_revision=self.online_revision
                     account=self.library_account
-                    if not account or q.get("libraryRevision")!=revision:
-                        return dict(found=[])
+                    if (not account or q.get("libraryRevision")!=revision or
+                            q.get("libraryContentRevision",content_revision)!=content_revision):
+                        return dict(deferred=True) if idle else dict(found=[])
+                    q["_presenceIdentity"]=(revision,content_revision,online_revision)
                     key=(revision,content_revision,kind,tuple(values))
                     prior=self.facets.get(key)
                 if prior and time.monotonic()-prior[0]<300:return prior[1]
-                result=self.api(dict(op="presence",kind=kind,values=values,account=account))
+                result=self.api(dict(op="presence",kind=kind,values=values,account=account,_idleMetadata=idle))
+                if result is None:return dict(deferred=True)
                 with self.lock:
-                    if revision==self.library_revision and content_revision==self.library_content_revision:
-                        self.facets[key]=(time.monotonic(),result)
+                    if (revision!=self.library_revision or content_revision!=self.library_content_revision or
+                            online_revision!=self.online_revision):
+                        return dict(deferred=True)
+                    self.facets[key]=(time.monotonic(),result)
                 return result
             rows=self.local_rows(scope, q.get("source", "all"))
             if not kind:return dict(found=list({r.get("kind") for r in rows if r.get("kind")}))
-            paths=[self.category(r) for r in rows if r.get("kind")==kind]
+            paths=[]
+            for row in rows:
+                if row.get("kind")!=kind:continue
+                path=self.category(row,idle=idle)
+                if path is None:return dict(deferred=True)
+                paths.append(path)
             return dict(found=[s for s in values if any(v==s or v.startswith(s+"--") for v in paths)])
         if op=="favorite":return self.favorite(q["uid"],bool(q["on"]))
         if op in {"cacheStats","clearCovers"}:
@@ -1604,9 +2035,10 @@ class Gallery:
             for path in (self.cache/"packages").glob("*"):
                 try:packages+=path.stat().st_size
                 except FileNotFoundError:continue
-            return dict(browse=browse,local=local,packages=packages)
-        if op=="taxonomy":return self.taxonomy()
+            return dict(browse=browse,local=local,packages=packages,limitMiB=self.settings["coverMiB"])
+        if op=="taxonomy":return self.taxonomy(idle=q.get("idle") is True)
         if op=="cover":return self.cover(q["uid"])
+        if op=="localFeedCard":return self.local_feed_card(q)
         if op=="card":return self.card(self.assets[q["uid"]])
         if op=="page":
             if q.get("refresh"):self.facets.clear()
@@ -1622,7 +2054,7 @@ class Gallery:
         if op=="submitBatch":return self.submit_batch(q)
         if op=="account":return self.api(dict(op="account"))
         if op=="librarySession":
-            return self.library_status()
+            return self.library_status(defer_if_busy=q.get("deferIfBusy") is True)
         if op=="logout":
             self.claims.pause.set()
             with self.library_session_lock:

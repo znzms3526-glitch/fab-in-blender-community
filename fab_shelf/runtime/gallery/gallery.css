@@ -39,8 +39,16 @@ aside{overflow:hidden}
 #transfer progress{width:34px}
 #tools{padding:10px 18px}
 #tools>div{gap:8px;flex-wrap:wrap;justify-content:flex-end}
-main:has(> #localSources:not([hidden])){grid-template-rows:auto auto auto minmax(0,1fr) auto}
-main:has(> #localSources:not([hidden])):has(> #bridgeBanner:not([hidden])){grid-template-rows:auto auto auto auto minmax(0,1fr) auto}
+main{position:relative;grid-template-rows:auto auto minmax(0,1fr)}
+main:has(> #localSources:not([hidden])){grid-template-rows:auto auto auto minmax(0,1fr)}
+main:has(> #localSources:not([hidden])):has(> #bridgeBanner:not([hidden])){grid-template-rows:auto auto auto auto minmax(0,1fr)}
+#empty:empty{display:none}
+#grid:not(.selecting) .batch-pick{display:none}
+.card{content-visibility:auto;contain-intrinsic-block-size:auto calc(var(--card) * .5625 + 100px)}
+#feedFooter{position:relative;border:0;min-height:36px;text-align:center;padding:12px 0 0}
+#feedSentinel{position:absolute;inset:auto 0 0;height:1px;pointer-events:none}
+#backToTop{position:absolute;z-index:3;inset:auto 24px 22px auto;width:38px;height:38px;padding:0;background:#283b33;border-color:#507163;color:#d0eee0;font-size:20px;box-shadow:0 3px 14px #0007}
+#backToTop:hover{background:#365346}
 #localSources{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:0 18px 10px}
 #localSources button{white-space:nowrap}
 #localSources button[aria-pressed=true]{background:#293b33;color:#c4efda;border-color:#527767}

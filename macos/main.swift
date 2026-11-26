@@ -67,10 +67,20 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigatio
             cfg.userContentController.add(self,name:"gallery")
         } else {
             script=(try? String(contentsOf:runtime.appendingPathComponent("owned.js"),encoding:.utf8)) ?? ""
-            if args[5]=="proxy", let u=URL(string:args[6]),let h=u.host,let p=u.port,let port=NWEndpoint.Port(rawValue:UInt16(clamping:p)){
-                cfg.websiteDataStore.proxyConfigurations=[ProxyConfiguration(httpCONNECTProxy:.hostPort(host:NWEndpoint.Host(h),port:port),tlsOptions:nil)]
+            if args[5]=="proxy", let u=URL(string:args[6]), let h=u.host, !h.isEmpty,
+               let p=u.port, p>0, p<=65535, let port=NWEndpoint.Port(rawValue:UInt16(p)),
+               u.user==nil, u.password==nil, u.path.isEmpty, u.query==nil, u.fragment==nil {
+                let endpoint=NWEndpoint.hostPort(host:NWEndpoint.Host(h),port:port)
+                switch u.scheme {
+                case "http":
+                    cfg.websiteDataStore.proxyConfigurations=[ProxyConfiguration(httpCONNECTProxy:endpoint,tlsOptions:nil)]
+                case "socks5":
+                    cfg.websiteDataStore.proxyConfigurations=[ProxyConfiguration(socksv5Proxy:endpoint)]
+                default:
+                    routeError="代理地址无效 / Invalid proxy address"
+                }
             } else if args[5] != "system" {
-                routeError="macOS 登录组件支持跟随系统或指定 HTTP 代理 / Choose System or Custom proxy for browsing."
+                routeError="macOS 登录组件支持跟随系统、HTTP 或 SOCKS5 代理 / Choose System, HTTP or SOCKS5 for browsing."
             }
         }
         NSApp.applicationIconImage=NSImage(contentsOf:runtime.appendingPathComponent("app.png"))
@@ -81,7 +91,9 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigatio
         window.title=gallery ? "Fab in Blender · "+args[6] : "Fab · Sign in"
         window.contentView=web; window.center()
         if gallery { show() }
-        web.load(URLRequest(url:URL(string:gallery ? "fabshelf://library/index.html":"https://www.fab.com/library")!))
+        if routeError==nil {
+            web.load(URLRequest(url:URL(string:gallery ? "fabshelf://library/index.html":"https://www.fab.com/library")!))
+        }
         timer=Timer.scheduledTimer(withTimeInterval:0.18,repeats:true){[weak self] _ in self?.tick()}
     }
     func show(){ NSApp.activate(ignoringOtherApps:true);window.makeKeyAndOrderFront(nil) }
@@ -140,7 +152,10 @@ final class Host: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigatio
             if let s=try? String(contentsOf:status,encoding:.utf8){reply(["notice":s]);try? fm.removeItem(at:status)}
         }else{
             let login=ipc.appendingPathComponent("login")
-            if fm.fileExists(atPath:login.path){try? fm.removeItem(at:login);show();web.load(URLRequest(url:URL(string:"https://www.fab.com/library")!))}
+            if fm.fileExists(atPath:login.path){
+                try? fm.removeItem(at:login)
+                if routeError==nil{show();web.load(URLRequest(url:URL(string:"https://www.fab.com/library")!))}
+            }
             let cmd=ipc.appendingPathComponent("cmd")
             guard !busy,let data=try? Data(contentsOf:cmd),let q=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
                 let rid=q["rid"] as? String else{return}

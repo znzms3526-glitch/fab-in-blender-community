@@ -125,7 +125,7 @@ def verify_queued_destination(root):
     print("PASS: queued imports remember their directories", flush=True)
 
 
-def verify_native_switch(root, archive):
+def verify_native_switch(root, archive, expected=(0, 13, 0)):
     import addon_utils
 
     user_config = Path(bpy.utils.user_resource("CONFIG", create=True)).resolve()
@@ -133,7 +133,7 @@ def verify_native_switch(root, archive):
     assert isolated and user_config.is_relative_to(Path(isolated).resolve()), "Run with an isolated BLENDER_USER_RESOURCES"
     assert "FINISHED" in bpy.ops.preferences.addon_install(filepath=str(archive))
     addon = addon_utils.enable("fab_shelf", default_set=True)
-    assert addon and addon.bl_info["version"] == (0, 13, 0)
+    assert addon and addon.bl_info["version"] == expected
     assert Path(addon.__file__).resolve().is_relative_to(Path(isolated).resolve())
     from fab_shelf import catalog, gallery
     originals = addon.host_command, addon.show_gallery
@@ -192,7 +192,8 @@ def main():
     args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     with tempfile.TemporaryDirectory(prefix="qa-013-", dir=repo.parent, ignore_cleanup_errors=True) as temp:
         if args and args[0] == "--native":
-            verify_native_switch(Path(temp), Path(args[1]).resolve())
+            expected = tuple(map(int, args[2].split("."))) if len(args) > 2 else (0, 13, 0)
+            verify_native_switch(Path(temp), Path(args[1]).resolve(), expected)
         else:
             sys.path.insert(0, str(repo))
             verify_queued_destination(Path(temp))

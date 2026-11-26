@@ -12,7 +12,8 @@ static class FabProfile {
         if(mode=="direct")flags="--no-proxy-server";
         else if(mode=="proxy"){
             Uri uri;
-            if(!Uri.TryCreate(proxy,UriKind.Absolute,out uri)||uri.Scheme!="http"||uri.UserInfo.Length!=0||
+            if(!Uri.TryCreate(proxy,UriKind.Absolute,out uri)||
+               (uri.Scheme!="http"&&uri.Scheme!="socks5")||uri.Host.Length==0||uri.Port<=0||proxy.Contains("@")||
                uri.AbsolutePath!="/"||uri.Query.Length!=0||uri.Fragment.Length!=0)
                 throw new ArgumentException("代理地址无效");
             flags="--proxy-server="+uri.GetLeftPart(UriPartial.Authority);

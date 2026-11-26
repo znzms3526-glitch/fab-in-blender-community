@@ -1,4 +1,5 @@
 """Verification suite for Fab in Blender 0.12.0 features and fixes."""
+from collections import OrderedDict
 import hashlib
 import json
 import os
@@ -71,6 +72,7 @@ def make_test_gallery(cache, box):
     g.stop = threading.Event()
     g.local = {}
     g.local_by_asset = {}
+    g.package_dimensions = OrderedDict()
     g.assets = {}
     g.jobs = {}
     g.leases = {}
