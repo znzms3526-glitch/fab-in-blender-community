@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import tempfile
+import uuid
 from zipfile import BadZipFile
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from . import catalog, scene, storage
 
 _SETTINGS_TEXT = ".Fab in Blender Project"
 _DIRECTORY_KEY = "fab_project_asset_dir"
+_TARGET_RUNTIME = uuid.uuid4().hex
+_BUILDER_VERSION = 1
 
 
 def _settings_text():
@@ -111,6 +114,12 @@ def stage_request(cache, project, request):
             name: (member, original, staged[layout][member]) for name, (layout, member, original) in assigned.items()
         }
         paths = [paths_by_member[member] for member in files]
+    elif originals := request.get("originalFiles"):
+        files = list(dict.fromkeys([*request["files"], *originals]))
+        paths = storage.stage(cache, project, dict(request, files=files), asset_root=root, checks=checks)
+        staged = dict(zip(files, paths))
+        request["_original_paths"] = {member: staged[member] for member in originals}
+        paths = [staged[member] for member in request["files"]]
     else:
         paths = storage.stage(cache, project, request, asset_root=root, checks=checks)
     request["_file_checks"] = checks
@@ -125,9 +134,37 @@ def reference(block):
         return {}
 
 
+def material_recipe(req):
+    if "recipe" not in req:
+        return None
+    if original := _preserved_glb(req):
+        return dict(builderVersion=_BUILDER_VERSION, materialPolicy="preserve",
+                    modelMember=original, members={member: scene.role(Path(member))
+                                                   for member in req.get("originalFiles", ())})
+    recipe = dict(req["recipe"])
+    recipe["builderVersion"] = _BUILDER_VERSION
+    recipe["channels"] = sorted(set(recipe.get("channels", ())))
+    recipe["members"] = {
+        member: scene.role(Path(member)) for member in req["files"]
+        if Path(member).suffix.lower() in storage.IMAGES
+    }
+    return recipe
+
+
+def _preserved_glb(req):
+    if req["mode"] == 0:
+        return next((member for member in req["files"] if Path(member).suffix.lower() == ".glb"), None)
+    return None
+
+
 def signature(req):
-    parts = [req["hash"], req["mode"], sorted(req["files"])]
-    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+    recipe = material_recipe(req)
+    files = [recipe["modelMember"]] if recipe and recipe.get("materialPolicy") == "preserve" else sorted(req["files"])
+    parts = [req["hash"], req["mode"], files]
+    if recipe:
+        source = model_source(req.get("source", {}), req["files"])
+        parts.extend((origin_identity(source), source["modelMember"], sorted(req.get("originalFiles", ())), recipe))
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
 
 
 def texture_nodes(mat):
@@ -142,11 +179,14 @@ def _remember_image(img, source, member, check=None):
     elif "fab_check" in img and (img.get("fab_member") != member or reference(img).get("hash") != source["hash"]):
         del img["fab_check"]
     img["fab_source"], img["fab_member"] = json.dumps(source), member
+    if channel := scene.role(Path(member)):
+        img["fab_role"] = channel
 
 
 def place(ctx, paths, req):
-    source = req.get("source", {"hash": req["hash"], "name": req["name"]})
+    source = model_source(req.get("source", {"hash": req["hash"], "name": req["name"]}), req["files"])
     tag = json.dumps(source)
+    identity = origin_identity(source)
     key = signature(req)
     mode = req["mode"]
     collection = ctx.view_layer.active_layer_collection.collection
@@ -157,6 +197,7 @@ def place(ctx, paths, req):
     independent = req.get("independent")
     if mode == 0 and not independent and ctx.mode == "OBJECT":
         mesh = next((m for m in bpy.data.meshes if not m.library and m.get("fab_key") == key
+                     and all(origin_identity(reference(mat)) == identity for mat in m.materials if mat)
                      and scene.textures_match(m.materials, verified_size)), None)
         if mesh:
             obj = bpy.data.objects.new(name, mesh)
@@ -170,12 +211,18 @@ def place(ctx, paths, req):
             return [obj]
     if mode == 1 and not independent:
         existing = next((m for m in bpy.data.materials if not m.library and m.get("fab_key") == key
+                         and origin_identity(reference(m)) == identity
                          and scene.textures_match([m], verified_size)), None)
         if existing:
             scene.assign(ctx.active_object, existing)
             return []
     before = set(bpy.data.materials)
-    objects = scene.import_files(ctx, paths, mode, name, texture_size=verified_size)
+    options = {}
+    if "recipe" in req:
+        options["recipe"] = req["recipe"]
+    if req.get("_original_paths"):
+        options["original_images"] = tuple(req["_original_paths"].values())
+    objects = scene.import_files(ctx, paths, mode, name, texture_size=verified_size, **options)
     meshes = [o for o in objects if o.type == "MESH"]
     reusable = (mode == 0 and not independent and len(meshes) == 1
                 and all(o.type == "EMPTY" or o == meshes[0] for o in objects)
@@ -184,17 +231,30 @@ def place(ctx, paths, req):
                 and not meshes[0].modifiers and not meshes[0].data.shape_keys
                 and not any(s.link == "OBJECT" for s in meshes[0].material_slots))
     mats = set(bpy.data.materials) - before
-    members = {storage.resolved_path(p):n for p,n in zip(paths,req["files"])}
+    staged = dict(zip(req["files"], paths)) | req.get("_original_paths", {})
+    members = {storage.resolved_path(path): member for member, path in staged.items()}
     checks = req.get("_file_checks", {})
+    recipe = material_recipe(req)
+    images = {}
     for mat in mats:
         mat["fab_source"] = tag
+        if recipe:
+            mat["fab_recipe"] = json.dumps(recipe, sort_keys=True)
         if mode == 1 and not independent:
             mat["fab_key"] = key
-        for node in texture_nodes(mat):
+        replacements = {}
+        for _, node in bound_textures(mat):
             img = node.image
             member = members.get(storage.resolved_path(bpy.path.abspath(img.filepath)))
             if member:
+                if (previous := reference(img)) and origin_identity(previous) != identity:
+                    if img not in images:
+                        images[img] = img.copy()
+                    replacements[img] = images[img]
+                    img = replacements[img]
                 _remember_image(img, source, member, checks.get(member))
+        if replacements:
+            scene._write_image_replacements(mat.node_tree, replacements)
     if objects:
         scene.place_at_cursor(ctx, objects, collection, cursor)
     for obj in meshes:
@@ -210,62 +270,269 @@ def source_materials(obj):
     return list(dict.fromkeys(s.material for s in obj.material_slots if reference(s.material))) if obj else []
 
 
-def image_family(member):
-    # Quality and resolution tags can differ across the two packages.
-    return re.sub(r"(?i)(?<![a-z0-9])(?:1k|2k|4k|8k|16k|low|mid|medium|high|raw)(?![a-z0-9])", "", Path(member).stem).casefold()
+def model_source(source, members=None):
+    source = dict(source)
+    if "modelMember" not in source:
+        models = [member for member in (members or source.get("members", ()))
+                  if Path(member).suffix.lower() in storage.MODELS]
+        source["modelMember"] = models[0] if len(models) == 1 else ""
+    model = source["modelMember"]
+    if model:
+        source.setdefault("modelFormat", Path(model).suffix[1:].upper())
+        lod = re.search(r"(?:^|[_ .-])lod(\d+)(?:$|[_ .-])", Path(model).stem, re.I)
+        source.setdefault("lod", int(lod[1]) if lod else None)
+    return source
+
+
+def origin_identity(source):
+    if source.get("bridge"):
+        return ("Bridge", source.get("quixel_id") or source.get("bridgeId"))
+    return ("Fab", source.get("uid") or source.get("hash"))
+
+
+def texture_origin(obj, mat):
+    stored = reference(mat)
+    source = model_source(stored)
+    model = model_source(reference(obj))
+    if ("modelMember" not in stored and not source["modelMember"] and model["modelMember"]
+            and origin_identity(source) == origin_identity(model) and source.get("kind") != "material"):
+        # Older projects could overwrite the material record with a texture-only package.
+        source.update({key: model[key] for key in ("modelMember", "modelFormat", "lod")})
+    return source
+
+
+def bound_textures(mat):
+    def nodes(tree, prefix, parents):
+        if tree is None or tree in parents:
+            return
+        for node in tree.nodes:
+            path = (*prefix, node.name)
+            if node.type == "TEX_IMAGE" and node.image:
+                yield path, node
+            elif node.type == "GROUP" and node.node_tree:
+                yield from nodes(node.node_tree, path, parents | {tree})
+
+    return list(nodes(mat.node_tree, (), set())) if mat else []
+
+
+def rotate_target_runtime():
+    global _TARGET_RUNTIME
+    _TARGET_RUNTIME = uuid.uuid4().hex
+
+
+def _binding_origin(image, origin):
+    source = reference(image)
+    member = image.get("fab_member")
+    if not source and not member:
+        return "foreign"
+    uid = source.get("uid")
+    if source.get("bridge") or (uid and uid != origin.get("uid")):
+        return "foreign"
+    same_asset = uid and uid == origin.get("uid")
+    same_package = (source.get("hash") and source["hash"] == origin.get("hash")
+                    and member in origin.get("members", ()))
+    if (same_asset or same_package) and image.source == "FILE" and member:
+        return "owned"
+    return "unknown"
+
+
+def _bindings(obj, mat):
+    origin = texture_origin(obj, mat)
+    return [[list(path), img.name, img.filepath, reference(img).get("hash"), img.get("fab_member"),
+             img.colorspace_settings.name, img.alpha_mode, bool(img.packed_file), list(img.size),
+             _binding_origin(img, origin)]
+            for path, node in bound_textures(mat) if (img := node.image)]
+
+
+def capture_texture_target(obj, mat):
+    for block, key in ((obj, "fab_target"), (mat, "fab_material_target")):
+        if not block.get(key):
+            block[key] = uuid.uuid4().hex
+    return dict(name=obj.name, id=obj["fab_target"], material=mat.name, materialId=mat["fab_material_target"],
+                bindings=_bindings(obj, mat), runtime=_TARGET_RUNTIME,
+                objectSession=getattr(obj, "session_uid", None), materialSession=getattr(mat, "session_uid", None))
+
+
+def bindings_match(current, saved):
+    return (isinstance(saved, list) and len(current) == len(saved)
+            and all(isinstance(old, list) and len(old) in (8, 9, 10)
+                    and new[:len(old)] == old for new, old in zip(current, saved)))
+
+
+def _upgrade_materials(obj, req):
+    if obj.library:
+        raise ValueError("请先将链接物体追加到当前工程，再切换贴图规格")
+    target = req.get("target") or {}
+    current_runtime = target.get("runtime") == _TARGET_RUNTIME
+    if ((target.get("id") and target["id"] != obj.get("fab_target"))
+            or (current_runtime and target.get("objectSession") != getattr(obj, "session_uid", None))):
+        raise ValueError("原目标物体已更改，请重新选择")
+    materials = [mat for mat in source_materials(obj)
+                 if not target.get("material") or mat.name == target["material"]]
+    if "materialId" in target:
+        materials = [mat for mat in materials if mat.get("fab_material_target") == target["materialId"]
+                     and (not current_runtime or target.get("materialSession") == getattr(mat, "session_uid", None))
+                     and bindings_match(_bindings(obj, mat), target.get("bindings"))]
+    if not materials:
+        raise ValueError("原目标材质或已绑定贴图发生改变，请重新选择")
+    source = req["source"]
+    allowed = []
+    for mat in materials:
+        if req.get("shared") and mat.library:
+            raise ValueError("无法直接更新链接材质，请关闭更新共用物体后重试")
+        origin = texture_origin(obj, mat)
+        if origin_identity(origin) != origin_identity(source):
+            continue
+        if origin.get("bridge"):
+            raise ValueError("请在副屏 Bridge 库中直接选择目标分辨率重新导入")
+        fmt = origin.get("modelFormat") or origin.get("fmt")
+        if fmt == "GLB":
+            raise ValueError("当前材质来自 GLB。请在详情选择对应规格文件包重新导入，原有材质保持不变")
+        available = source.get("modelFormat") or source.get("fmt")
+        if available == "GLB" or (available == "FBX" and fmt != "FBX"):
+            raise ValueError("此贴图包与原模型格式不兼容")
+        if not same_upgrade_model(origin, source.get("modelMembers", ())):
+            raise ValueError("此贴图包与原模型的精度或版本不兼容")
+        allowed.append(mat)
+    if not allowed:
+        raise ValueError("目标材质与此素材来源不匹配")
+    return allowed
+
+
+def _texture_family(member):
+    parts = storage.safe_member(member).parts
+    def labels(part):
+        return tuple(word for word in re.findall(r"[^\W_]+", part.casefold())
+                     if not storage.TEXTURE_TIER.fullmatch(word))
+    return tuple(key for part in parts[:-1] if (key := labels(part))), labels(Path(parts[-1]).stem)
+
+
+def match_upgrade_members(old_members, candidate_members):
+    prior = {member: _texture_family(member) for member in old_members if member}
+    candidates = {member: _texture_family(member) for member in candidate_members}
+    results = {}
+    for old, family in prior.items():
+        matches = [member for member, value in candidates.items() if value == family]
+        if len(matches) == 1:
+            results[old] = matches[0]
+    return results
+
+
+def missing_upgrade(texture_k, names=()):
+    examples = " · 核对 " + "、".join(Path(name).name for name in list(names)[:3]) if names else ""
+    return ValueError(f"当前资产缺少完整的 {texture_k}K 贴图，未修改材质{examples}")
+
+
+def upgrade_members(bindings, texture_k):
+    required = set()
+    for row in bindings:
+        path, name, _, _, member = row[:5]
+        origin = row[9] if len(row) > 9 else "owned" if member else "foreign"
+        if origin == "foreign" or (len(row) >= 9 and max(row[8]) == texture_k * 1024):
+            continue
+        if origin != "owned" or not member or len(path) != 1:
+            raise missing_upgrade(texture_k, [member or name])
+        required.add(member)
+    return required
+
+
+def same_upgrade_model(origin, members):
+    models = [member for member in members if Path(member).suffix.lower() in storage.MODELS]
+    if not models:
+        return True
+    expected = model_source(origin)["modelMember"]
+    return not expected or any(Path(member).suffix.lower() == ".fbx"
+                               and _texture_family(member) == _texture_family(expected) for member in models)
+
+
+def plan_upgrade(obj, paths, req):
+    """Inspect staged images and the original bindings without modifying Blender data."""
+    edge = int(req.get("textureK") or req["source"].get("k") or 0) * 1024
+    if not edge:
+        raise ValueError("缺少贴图目标尺寸")
+    files = {}
+    for path, member in zip(paths, req["files"]):
+        if Path(member).suffix.lower() not in storage.IMAGES:
+            continue
+        with storage.fs_path(path).open("rb") as stream:
+            size = catalog.image_dimensions(stream, path.suffix.lower())
+        if size and max(size) == edge:
+            files[member] = path
+    changes, missing = [], []
+    texture_k = edge // 1024
+    for mat in _upgrade_materials(obj, req):
+        origin = texture_origin(obj, mat)
+        bindings = _bindings(obj, mat)
+        required = upgrade_members(bindings, texture_k)
+        matches = match_upgrade_members(required, files)
+        missing.extend(sorted(required - matches.keys()))
+        for node_path, node in bound_textures(mat):
+            image = node.image
+            if (len(node_path) == 1 and max(image.size) != edge
+                    and _binding_origin(image, origin) == "owned"
+                    and (replacement := matches.get(image.get("fab_member")))):
+                changes.append((mat, node.name, files[replacement], replacement))
+    if missing:
+        raise missing_upgrade(texture_k, missing)
+    if not changes:
+        raise ValueError("没有需要切换的 Fab 外部贴图，材质保持当前规格")
+    return changes
 
 
 def upgrade(obj, paths, req):
+    changes = plan_upgrade(obj, paths, req)
     source = req["source"]
-    uid = source.get("uid") or source["hash"]
-    material_name = (req.get("target") or {}).get("material")
-    mats = [m for m in source_materials(obj) if (reference(m).get("uid") or reference(m).get("hash")) == uid
-            and (not material_name or m.name == material_name)]
-    if not mats:
-        raise ValueError("目标物体与此 Fab 来源不匹配")
-    plan = {}
     checks = req.get("_file_checks", {})
-    for mat in mats:
-        for node in texture_nodes(mat):
-            old = node.image
-            member = old.get("fab_member")
-            if not member:
-                continue
-            candidates = [(p,n) for p,n in zip(paths,req["files"]) if image_family(n) == image_family(member)]
-            if not candidates and scene.role(Path(member)):
-                candidates = [(p,n) for p,n in zip(paths,req["files"]) if scene.role(Path(n)) == scene.role(Path(member))]
-                if sum(scene.role(Path(x.image.get("fab_member",""))) == scene.role(Path(member)) for x in texture_nodes(mat)) != 1:
-                    continue
-            if len(candidates) == 1:
-                p,n = candidates[0]
-                img = bpy.data.images.load(str(storage.fs_path(p)), check_existing=True)
-                if img == old or max(img.size)!=int(source["k"])*1024:
-                    continue
-                if img.users and img.colorspace_settings.name != old.colorspace_settings.name:
-                    img = img.copy()
-                img.colorspace_settings.name = old.colorspace_settings.name
-                scene.set_image_path(img, p)
-                _remember_image(img, source, n, checks.get(n))
-                plan.setdefault(mat, []).append((node.name, img))
-    if not plan:
-        raise ValueError("没有可替换的匹配通道，或已使用该规格")
-    for original,changes in plan.items():
-        mat = original if req.get("shared") else original.copy()
+    edge = int(req.get("textureK") or source["k"]) * 1024
+    images, mats, prepared = {}, {}, []
+    try:
+        for original, node_name, path, member in changes:
+            old = original.node_tree.nodes[node_name].image
+            key = (member, old.colorspace_settings.name, old.alpha_mode, bool(old.packed_file))
+            if key not in images:
+                if (check := checks.get(member)) and not storage.file_matches(path, *check):
+                    raise ValueError(f"贴图文件已改变，请重试 · {member}")
+                img = bpy.data.images.load(str(storage.fs_path(path)), check_existing=False)
+                images[key] = img
+                if max(img.size) != edge:
+                    raise ValueError(f"贴图尺寸与确认时不一致 · {member}")
+                img.colorspace_settings.name, img.alpha_mode = key[1:3]
+                scene.set_image_path(img, path)
+                if old.packed_file and not img.packed_file:
+                    img.pack()
+                    if not img.packed_file:
+                        raise ValueError(f"无法打包目标贴图 · {member}")
+                _remember_image(img, source, member, check)
+            if original not in mats:
+                mat = original if req.get("shared") else original.copy()
+                mats[original] = mat
+                if mat != original and "fab_material_target" in mat:
+                    del mat["fab_material_target"]
+            node = mats[original].node_tree.nodes[node_name]
+            prepared.append((node, images[key]))
+    except Exception:
+        for original, mat in mats.items():
+            if mat != original:
+                bpy.data.materials.remove(mat)
+        for img in images.values():
+            if not img.users:
+                bpy.data.images.remove(img)
+        raise
+    for node, img in prepared:
+        node.image = img
+    for original, mat in mats.items():
         if mat != original:
             for slot in obj.material_slots:
                 if slot.material == original:
                     slot.link = "OBJECT"
                     slot.material = mat
-        if "fab_key" in mat:
-            del mat["fab_key"]
-        if req.get("shared"):
+        else:
             for mesh in bpy.data.meshes:
                 if "fab_key" in mesh and original in mesh.materials[:]:
                     del mesh["fab_key"]
-        for node_name,img in changes:
-            mat.node_tree.nodes[node_name].image = img
-        mat["fab_source"] = json.dumps(source)
-    return sum(map(len,plan.values()))
+        if "fab_key" in mat:
+            del mat["fab_key"]
+    return len(prepared)
 
 
 def _valid_check(value):
@@ -399,7 +666,7 @@ def repair_download(req, paths):
     for member, path in members.items():
         expected[storage.resolved_path(path)] = member
         expected[storage.resolved_path(storage.legacy_compact_path(project, digest, member))] = member
-    count = 0
+    targets_to_repair = []
     repair_paths = req.get("_repair_paths", {})
     checks = req.get("_file_checks", {})
     for img in bpy.data.images:
@@ -419,13 +686,17 @@ def repair_download(req, paths):
                 member = expected.get(current)
             path = members.get(member)
         if path is not None:
-            reload_image(img, path)
-            if req.get("source"):
-                _remember_image(img, req["source"], member, checks.get(member))
-            count += 1
-    if not count:
+            check = checks.get(member)
+            if check is not None and not storage.file_matches(path, *check):
+                raise ValueError(f"暂存贴图校验失败，未修复 · {member}")
+            targets_to_repair.append((img, member, path, check))
+    if not targets_to_repair:
         raise ValueError("没有可恢复的目标贴图")
-    return count
+    for img, member, path, check in targets_to_repair:
+        reload_image(img, path)
+        if req.get("source"):
+            _remember_image(img, req["source"], member, check)
+    return len(targets_to_repair)
 
 
 def relink(cache, selected):

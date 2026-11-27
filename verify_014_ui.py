@@ -241,9 +241,60 @@ async function runFixture() {
     throw Error("Cover cache popover did not show the active 128 MiB limit");
   }
   document.querySelector("#menu").hidePopover();
+  const modelCard = cards()[0];
+  const labels = card => [...card.querySelectorAll(".levels button")].map(button => button.textContent);
+  if (modelCard.querySelector(".actions select") || labels(modelCard).join() !== ["低", "中", "高"].map(tr).join()) {
+    throw Error("The model card must show only the three combined presets");
+  }
+  const materialCard = card({uid:"fixture-material",title:"Fixture material",kind:"material",local:[]});
+  if (labels(materialCard).join() !== "1K,2K,4K,8K") throw Error("The material card lost separate texture sizes");
+  const primary = modelCard.querySelector(".actions .primary");
+  if (primary.textContent !== tr("获取并导入")) throw Error("An unverified model should show Get and import");
+  modelCard.asset.local = [{fmt:"FBX",dimensions:[[2048,2048],[4096,4096]]}];
+  modelCard.querySelector('[data-variant="high"]').click();
+  if (primary.textContent !== tr("导入")) throw Error("Mixed-resolution cached models should show Import");
+  primary.click();
+  await waitFor(() => document.querySelector("#toast").textContent === "Fixture imported mixed ZIP",
+                "Model card did not request import from the mixed ZIP cache");
+  const toolbar = document.querySelector("#importSettings");
+  if (toolbar.classList.contains("primary") || toolbar.textContent.includes("+")) {
+    throw Error("Import settings must be neutral and unadorned at defaults");
+  }
+  toolbar.click();
+  const panel = document.querySelector("#importSettingsPanel");
+  const channel = (view, name) => view.querySelector('.channel-picker input[data-channel="' + name + '"]');
+  await waitFor(() => panel.querySelectorAll(".channel-picker input").length === Object.keys(importChannels).length,
+                "Shared import preferences did not appear");
+  if (extraChannels.some(name => channel(panel, name).checked) || !panel.querySelector(".import-height-options").hidden ||
+      !panel.querySelector(".import-node-settings input").checked ||
+      panel.querySelector(".import-preset-options input:checked").value !== "high") {
+    throw Error("The shared import defaults do not match the Bridge-style form");
+  }
+  const height = channel(panel, "Height");
+  height.click();
+  const heightOptions = panel.querySelector(".import-height-options");
+  if (heightOptions.hidden || heightOptions.querySelector("select").value !== "bump") {
+    throw Error("Height opt-in did not reveal the default bump mode");
+  }
+  height.click();
+  channel(panel, "AO").click();
+  panel.querySelector("button").click();
+  await waitFor(() => !panel.matches(":popover-open") && importPreferences.channels.includes("AO") &&
+                toolbar.textContent.endsWith("+1"),
+                "Import toolbar did not persist an explicit AO opt-in");
+  await openPreferences("导入");
+  const shared = document.querySelector("#importSettingsPage");
+  if (!channel(shared, "AO")?.checked) throw Error("The full settings view did not reflect the shared toolbar opt-in");
+  channel(shared, "Specular").click();
+  await document.querySelector("#prefSave").onclick();
+  document.querySelector("#prefClose").click();
+  toolbar.click();
+  await waitFor(() => channel(panel, "Specular")?.checked && toolbar.textContent.endsWith("+2"),
+                "Toolbar settings did not reflect opt-in saved in full settings");
+  panel.hidePopover();
   return {cards: uids.length, cachePreview: true, earlyBatch: true, retry: true, silentHeadChange: true,
           selection: true, staleSearch: true, refreshedCursor:true, accountWait:true, coverLimit:true,
-          classification};
+          autoFileWithSharedImportSettings:true, classification};
 }
 runFixture().then(result => chrome.webview.postMessage({op:"verifyFeedUi",report:result}),
                   error => chrome.webview.postMessage({op:"verifyFeedUi",error:error.message}));
@@ -327,6 +378,10 @@ def verify_feed_ui(root):
                 app.page_cache.clear()
                 app.library_head_checked = time.monotonic()
             return True
+        if query["op"] == "variant" and query["uid"] == "fixture-switched":
+            assert query["import"] is True
+            assert query["selection"] == dict(mode="auto",preset="high",textureK=4,modelTier="high")
+            return dict(state="cached",message="Fixture imported mixed ZIP")
         return handle(query)
 
     app.api, app.handle = api, commands

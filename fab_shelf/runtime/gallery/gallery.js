@@ -13,6 +13,71 @@ let stream=null;
 let claimIdentity="",claimRunning=false,claimTimer,claimToken=0;
 const kinds={ALL:"全部资产","3d-model":"模型",material:"材质",decal:"贴花"};
 const scopes={...(hasFabBrowser?{discover:"探索 Fab"}:{}),owned:"我的 Fab 库",local:"已下载",favorites:"收藏",queue:"下载队列"};
+const meshTiers={low:"低模",medium:"中模",high:"高模"};
+const meshPresets={low:"低",medium:"中",high:"高"};
+const presetTextureSize={low:2,medium:2,high:4};
+const importChannels={"Base Color":"底色",Normal:"法线",Roughness:"粗糙度",Metallic:"金属度",
+  AO:"环境光遮蔽",Specular:"高光",Alpha:"透明度",Height:"凹凸 / 置换"};
+const existingChannels=["Base Color","Normal","Roughness","Metallic","Alpha"];
+const extraChannels=["AO","Specular","Height"];
+let importPreferences={channels:existingChannels,
+  heightMode:"off",mapping:true,modelTier:"high"};
+function baseRecipe(asset, tier=selection(asset).modelTier){
+  const heightMode=asset.kind==="decal"&&importPreferences.heightMode==="displacement"?"bump":importPreferences.heightMode;
+  return {channels:[...importPreferences.channels],
+    mapping:importPreferences.mapping,heightMode,modelTier:tier||importPreferences.modelTier};
+}
+function meshPicker(value){
+  const select=el("select");
+  select.ariaLabel=tr("首选模型精度");
+  for(const [key,label] of Object.entries(meshTiers)){
+    const option=el("option",null,label);option.value=key;select.append(option);
+  }
+  select.value=value||importPreferences.modelTier;
+  return select;
+}
+function channelPicker(selected, label, disabled=[], keys=Object.keys(importChannels)){
+  const group=el("fieldset","channel-picker"), checks=[];
+  group.append(el("legend",null,label));
+  for(const key of keys){
+    const row=el("label",null,importChannels[key]), input=el("input");
+    input.type="checkbox";input.checked=selected.includes(key);input.disabled=disabled.includes(key);
+    input.dataset.channel=key;
+    if(input.disabled)row.title=tr("在导入设置中启用");
+    row.prepend(input);group.append(row);
+    checks.push([key,input]);
+  }
+  return {node:group,read:()=>checks.filter(([,input])=>input.checked).map(([key])=>key),
+    apply:values=>checks.forEach(([key,input])=>{input.checked=values.includes(key)})};
+}
+function sharedRecipeControls(initial,allowHeight=true,decal=false){
+  const controls=el("div","recipe-controls"), mapping=el("input"), height=el("select");
+  mapping.type="checkbox";height.disabled=!allowHeight;
+  const mappingLabel=el("label",null,"自动添加纹理坐标");mappingLabel.prepend(mapping);
+  const heightLabel=el("label","field","高度贴图模式");
+  for(const [key,label] of Object.entries({off:"关闭",bump:"仅凹凸",displacement:"真置换"})){
+    if(decal&&key==="displacement")continue;
+    const option=el("option",null,label);option.value=key;height.append(option);
+  }
+  heightLabel.append(height);controls.append(mappingLabel,heightLabel);
+  const apply=recipe=>{mapping.checked=recipe.mapping;height.value=recipe.heightMode};
+  apply(initial);
+  return {node:controls,read:()=>({mapping:mapping.checked,heightMode:height.value}),apply};
+}
+function optionalRecipe(asset){
+  const details=el("details","import-override");
+  details.append(el("summary",null,"本次导入设置"));
+  const defaults=()=>baseRecipe(asset), initial=defaults();
+  const disabled=extraChannels.filter(channel=>!initial.channels.includes(channel)||(channel==="Height"&&initial.heightMode==="off"));
+  const channels=channelPicker(initial.channels,"导入贴图通道",disabled),
+    shared=sharedRecipeControls(initial,!disabled.includes("Height"),asset.kind==="decal");
+  let overridden=false;
+  details.addEventListener("change",()=>{overridden=true});
+  details.append(channels.node,shared.node,button("恢复默认",()=>{
+    const values=defaults();channels.apply(values.channels);shared.apply(values);overridden=false;
+  }));
+  return {node:details,read:()=>overridden?{...shared.read(),channels:channels.read(),modelTier:defaults().modelTier}:defaults()};
+}
 function rpc(op,data={},onPreview){
  const id=requestId();return new Promise((resolve,reject)=>{pending.set(id,{resolve,reject,onPreview});chrome.webview.postMessage({id,op,...data});});
 }
@@ -73,58 +138,106 @@ function texturePicker(k){
  select.value=k;
  return select;
 }
-function renderDownloads(target,files,submit,preferred){
+function renderDownloads(target,files,submit,preferred,asset,allowImport=false){
  if(!files.length){target.append(el("p",null,"此商品无可用的 Blender 格式"));return}
- const label=el("label","field","文件格式"), select=el("select");
- for(const fmt of new Set(files.map(file=>file.fmt))){
-   const option=el("option",null,fmt);
-   option.value=fmt;
+ const label=el("label","field","可用文件"), select=el("select"), auto=el("option",null,"自动");
+ select.append(auto);auto.value="";
+ for(const file of files){
+   const option=el("option","name",variantLabel(file));
+   option.value=file.uid;
    select.append(option);
  }
- if(files.some(file=>file.fmt===preferred?.fmt))select.value=preferred.fmt;
  const labelK=el("label","field","首选贴图尺寸"), sizePicker=texturePicker(preferred?.k||2);
  labelK.append(sizePicker);
  label.append(select);
- const list=el("div");
- const showFiles=()=>list.replaceChildren(...files.filter(file=>file.fmt===select.value)
-   .map(file=>el("p","name",variantLabel(file))));
- select.onchange=showFiles;
- showFiles();
- const add=button("加入下载队列",async()=>{
-   sizePicker.disabled=select.disabled=add.disabled=true;
-   try{await submit({fmt:select.value,k:Number(sizePicker.value)})}
-   finally{sizePicker.disabled=select.disabled=add.disabled=false}
- },"primary");
- target.append(labelK,label,list,add);
+ const modelLabel=el("label","field","首选模型精度"), modelPicker=meshPicker(preferred?.modelTier);
+ modelLabel.append(modelPicker);modelLabel.hidden=asset.kind!=="3d-model";
+ const override=optionalRecipe(asset);
+ const actions=el("div","controls");
+ const prepare=async(importAfter)=>{
+   sizePicker.disabled=select.disabled=modelPicker.disabled=true;
+   for(const action of actions.children)action.disabled=true;
+   try{
+     const requested={k:Number(sizePicker.value),modelTier:modelLabel.hidden?undefined:modelPicker.value};
+     if(select.value)requested.fileId=select.value;
+     await submit(requested,{...override.read(),modelTier:requested.modelTier||importPreferences.modelTier},importAfter);
+   }finally{
+     sizePicker.disabled=select.disabled=modelPicker.disabled=false;
+     for(const action of actions.children)action.disabled=false;
+   }
+ };
+ if(allowImport)actions.append(button("下载并导入",()=>prepare(true),"primary"));
+ actions.append(button(allowImport?"仅下载":"加入下载队列",()=>prepare(false),allowImport?"":"primary"));
+ target.append(labelK,modelLabel,label,override.node,actions);
 }
-function importSettings(copy,textureK,uid){
- return {hash:copy.hash,k:copy.k,textureK,uid};
+function importSettings(copy,requested,uid,recipe){
+ return {hash:copy.hash,k:copy.k,textureK:requested.k,uid,recipe};
 }
-function variantKey(uid,fmt,k){return JSON.stringify([uid,fmt,k])}
+function variantKey(uid,k,tier){return JSON.stringify([uid,k,tier||""])}
 function showVariantResult(uid,requested,result){
- const key=variantKey(uid,requested.fmt,requested.k);
- if(result.notice)variantNotices.set(key,result.notice);
+ const key=variantKey(uid,requested.k,requested.modelTier);
+ const actual=[result.format,result.lod==null?"":"LOD "+result.lod,result.notice].filter(Boolean).join(" · ");
+ if(result.notice)variantNotices.set(key,actual);
  else variantNotices.delete(key);
  toast(result.message);
-  tiles.get(uid)?.refreshActions?.();
+ const tile=tiles.get(uid);
+ if(tile?.asset.localOnly&&result.modelTiers)tile.asset.verifiedTiers=result.modelTiers;
+ tile?.refreshActions?.();
  if(result.state==="queued")poll();
 }
-function transferVariant(asset,requested,importAfter){
- return rpc("variant",{uid:asset.uid,fmt:requested.fmt,textureK:requested.k,import:importAfter});
+function selectionRequest(requested){
+  const {fileId,localHash,modelMember,k,modelTier,preset}=requested;
+  return {mode:fileId||localHash?"locked":"auto",textureK:k,modelTier,preset,fileId,localHash,modelMember};
 }
-function localActions(asset,copy,target){
+function transferVariant(asset,requested,importAfter,recipe=baseRecipe(asset,requested.modelTier)){
+ return rpc("variant",{uid:asset.uid,selection:selectionRequest(requested),recipe,import:importAfter});
+}
+function alternativeLabel(choice){
+  const pixels=choice.dimensions?.map(([w,h])=>w+"×"+h).join(" / ");
+  const mesh=choice.lod==null?(choice.modelTier?tr(meshTiers[choice.modelTier]):""):"LOD "+choice.lod;
+  return [choice.local?tr("已缓存"):"",choice.format,choice.converted?tr("Fab 转码"):"",mesh,pixels||(choice.textureK?choice.textureK+"K · "+tr("文件标称"):tr("贴图尺寸待确认")),
+    choice.bytes?size(choice.bytes):"",choice.name].filter(Boolean).join(" · ");
+}
+function handleVariantResult(asset,requested,result,retry){
+  if(result.state!=="confirm"){showVariantResult(asset.uid,requested,result);return}
+  const before=version;
+  showVariantChoices(result.choices,async choice=>{
+    if(before!==version)return;
+    const selected={...requested,fileId:choice.fileId,localHash:choice.localHash,modelMember:choice.modelMember};
+    const resolved=await retry(selected);
+    if(before===version)handleVariantResult(asset,requested,resolved,retry);
+  });
+}
+function showVariantChoices(choices,onSelect){
+  const dialog=$("#variantConfirm"), target=$("#variantAlternatives");
+  target.replaceChildren();
+  for(const [index,choice] of choices.entries()){
+    target.append(button(alternativeLabel(choice),async()=>{
+      dialog.close();
+      await onSelect(choice,index);
+    },"variant-alternative"));
+  }
+  if(!dialog.open)dialog.showModal();
+  layoutFab();
+}
+$("#variantConfirmClose").onclick=()=>$("#variantConfirm").close();
+$("#variantConfirm").onclose=()=>layoutFab();
+function localActions(asset,copy,target,pinned=false,preferred=selection(asset)){
  const controls=el("div","controls"), feedback=el("p","asset-feedback");
  feedback.role="status";
  const custom=el("details","asset-options");
  custom.append(el("summary",null,"规格与导入选项"));
  let selected=null;
- const request=()=>({...importSettings(copy,selection(asset).k,asset.uid),...selected?.()});
+ const override=optionalRecipe(asset);
+ const recipe=()=>({...override.read(),modelTier:preferred.modelTier||importPreferences.modelTier});
+ const request=()=>({...importSettings(copy,preferred,asset.uid,recipe()),...selected?.()});
  const use=button("导入",async()=>{
    use.disabled=true;
    try{
-     const requested={fmt:copy.fmt,k:selection(asset).k};
-     const result=await transferVariant(asset,requested,true);
-     showVariantResult(asset.uid,requested,result);
+     const requested={k:preferred.k,modelTier:preferred.modelTier,localHash:pinned?copy.hash:undefined};
+     const submit=choice=>transferVariant(asset,choice,true,recipe());
+     const result=await submit(requested);
+     handleVariantResult(asset,requested,result,submit);
      feedback.textContent=tr(result.message);
    }catch(e){feedback.textContent=tr(e.message)}
    finally{use.disabled=false}
@@ -180,33 +293,35 @@ function localActions(asset,copy,target){
    custom.dataset.loaded="1";
    const loading=el("p",null,"正在读取…");custom.append(loading);
    try{
-     const result=await rpc("members",importSettings(copy,selection(asset).k,asset.uid));
+     const result=await rpc("members",request());
      const label=el("label","field","导入模式"), mode=el("select");
      ["模型","材质","贴花"].forEach((text,index)=>{
        const option=el("option",null,text);option.value=index;mode.append(option);
      });
      mode.value=result.mode;label.append(mode);loading.replaceWith(label);
+    if(result.conflict)custom.append(el("p","multi-model-hint",result.conflict));
      if(result.modelCount>1){
        custom.append(el("p","multi-model-hint","包内含 "+result.modelCount+" 个模型文件，已自动优先选择主模型；如需其他部件请在下方勾选切换。"));
      }
      const checks=result.names.map(name=>{
        const field=el("label","member"), input=el("input");
        input.type="checkbox";input.checked=result.files.includes(name);
+       input.disabled=(result.disabled||[]).includes(name);
+       if(input.disabled)field.title=tr("此贴图通道未在导入设置中启用");
        field.append(input,document.createTextNode(name));custom.append(field);
        return [name,input];
      });
-     selected=()=>({mode:Number(mode.value),files:checks.filter(([,input])=>input.checked).map(([name])=>name)});
+     selected=()=>({mode:Number(mode.value),files:checks.filter(([,input])=>input.checked&&!input.disabled).map(([name])=>name)});
      custom.append(
        button("按所选文件导入",async()=>toast(await rpc("send",request()))),
        button("创建独立副本",async()=>toast(await rpc("send",{...request(),independent:true})))
      );
    }catch(e){loading.textContent=tr(e.message);delete custom.dataset.loaded}
  };
- target.replaceChildren(controls,deleteConfirm,feedback,custom);
+ target.replaceChildren(controls,deleteConfirm,feedback,override.node,custom);
 }
 function inspectAsset(a,img,requestedUnavailable=false){
  const dialog=$("#inspect"), spec=dialog.querySelector(".specs"), picture=dialog.querySelector("img");
- const includeImport=scope==="local";
  const preferred=selection(a);
  dialog.querySelector("h2").textContent=a.title;
  dialog.dataset.uid=a.uid;
@@ -223,20 +338,22 @@ function inspectAsset(a,img,requestedUnavailable=false){
  if(a.local.length){
    const label=el("label","field","已下载"), files=el("select"), commands=el("div","local-actions");
    files.ariaLabel=tr("已下载");
+   const cached=el("option",null,"自动");cached.value="";files.append(cached);
    for(const copy of a.local){
      const option=el("option","name",variantLabel(copy));option.value=copy.hash;files.append(option);
    }
-   const current=cachedCopy(a,preferred)||a.local[0];
    const labelK=el("label","field","首选贴图尺寸"), sizePicker=texturePicker(preferred.k);
-   files.value=current.hash;
+   const labelTier=el("label","field","首选模型精度"), modelPicker=meshPicker(preferred.modelTier);
+   labelTier.append(modelPicker);labelTier.hidden=a.kind!=="3d-model";
    const update=()=>{
-     const copy=a.local[files.selectedIndex];
-     chooseVariant(a,{fmt:copy.fmt,k:Number(sizePicker.value)});
-     localActions(a,copy,commands);
+     const advanced={k:Number(sizePicker.value),modelTier:labelTier.hidden?undefined:modelPicker.value};
+     const copy=a.local.find(file=>file.hash===files.value)||cachedCopy(a,advanced)||a.local[0];
+     localActions(a,copy,commands,Boolean(files.value),advanced);
    };
-   files.onchange=sizePicker.onchange=update;
+   files.onchange=sizePicker.onchange=modelPicker.onchange=update;
    label.append(files);labelK.append(sizePicker);
-   spec.append(label,labelK,commands);localActions(a,current,commands);
+   spec.append(label,labelK,labelTier,commands);
+   update();
  }
  if(!a.localOnly && !a.discovery){
    const target=el("div","remote-files");
@@ -248,12 +365,12 @@ function inspectAsset(a,img,requestedUnavailable=false){
        if(!target.isConnected||!dialog.open)return;
        target.replaceChildren();
        if(requestedUnavailable && files.length)target.append(el("p",null,"Fab 未提供所选格式，请选择可用文件。"));
-       renderDownloads(target,files,async requested=>{
-         const result=await transferVariant(a,requested,includeImport);
-         chooseVariant(a,requested);
-         showVariantResult(a.uid,requested,result);
-         if(result.state!=="missing")dialog.close();
-       },selection(a));
+       renderDownloads(target,files,async(requested,recipe,importAfter)=>{
+         const submit=choice=>transferVariant(a,choice,importAfter,recipe);
+         const result=await submit(requested);
+         handleVariantResult(a,requested,result,submit);
+         if(result.state==="cached"||result.state==="queued")dialog.close();
+       },preferred,a,true);
      }catch(e){target.replaceChildren(el("p",null,e.message),button("重试",list))}
    };
    target.append(button("查看其他 Fab 规格",list));spec.append(target);
@@ -278,32 +395,45 @@ document.addEventListener("keydown",e=>{
  e.preventDefault();inspectAsset(a,tile.querySelector("img"));
 });
 async function planBatch(){
- const token=++batchGeneration,k=parseInt($("#batchK").value),fmt=$("#batchFmt").value;
+ const token=++batchGeneration, k=parseInt($("#batchK").value), modelTier=$("#batchTier").value;
  batchPlan=null;$("#batchRun").disabled=true;$("#batchSummary").textContent=tr("正在核对规格…");
+ $("#batchConfirmations").replaceChildren();
  try{
-   const plan=await rpc("previewBatch",{uids:[...batchAssets.keys()],textureK:k,fmt});
+   const plan=await rpc("previewBatch",{uids:[...batchAssets.keys()],selection:selectionRequest({k,preset:modelTier})});
    if(token!==batchGeneration)return;
    batchPlan=plan.token;
    $("#batchSummary").textContent=[
      tr("需下载")+" "+plan.download,tr("已缓存")+" "+plan.cached,
      plan.fallback?tr("缓存贴图与首选尺寸不符或待确认")+" "+plan.fallback:"",
+     plan.confirm?tr("需确认组合")+" "+plan.confirm:"",
      tr("无此规格")+" "+plan.missing,tr("未能核对")+" "+plan.failed
    ].filter(Boolean).join(" · ");
+   for(const item of plan.confirmations||[]){
+     const label=el("label","field"), select=el("select"), skip=el("option",null,"跳过");
+     label.append(el("span","name",item.title));skip.value="";select.append(skip);
+     select.dataset.uid=item.uid;
+     item.choices.forEach((choice,index)=>{
+       const row=el("option","name",alternativeLabel(choice));row.value=index;select.append(row);
+     });
+     label.append(select);$("#batchConfirmations").append(label);
+   }
    $("#batchRun").disabled=!batchPlan;
  }catch(e){
    if(token===batchGeneration)$("#batchSummary").textContent=tr(e.message);
  }
 }
-$("#prepare").onclick=()=>{$("#batch").showModal();planBatch()};
-$("#batchK").onchange=$("#batchFmt").onchange=planBatch;
+$("#prepare").onclick=()=>{$("#batchTier").value=importPreferences.modelTier;$("#batch").showModal();planBatch()};
+$("#batchK").onchange=$("#batchTier").onchange=planBatch;
 $("#batch header button").onclick=()=>{if(!batchBusy)$("#batch").close()};
 $("#batch").oncancel=e=>{if(batchBusy)e.preventDefault()};
 $("#batch").onclose=()=>{++batchGeneration};
 $("#batchRun").onclick=async()=>{
  if(batchBusy||!batchPlan)return;
- batchBusy=true;$("#batchRun").disabled=$("#batchK").disabled=$("#batchFmt").disabled=true;
+ batchBusy=true;$("#batchRun").disabled=$("#batchK").disabled=$("#batchTier").disabled=true;
  try{
-   const {submitted,failed}=await rpc("submitBatch",{token:batchPlan});
+   const confirmed=Object.fromEntries([...$("#batchConfirmations").querySelectorAll("select")]
+     .filter(select=>select.value!=="").map(select=>[select.dataset.uid,Number(select.value)]));
+   const {submitted,failed}=await rpc("submitBatch",{token:batchPlan,confirmed});
     for(const uid of submitted){
       batchAssets.delete(uid);
       const checkbox=tiles.get(uid)?.querySelector(".batch-pick");
@@ -318,7 +448,7 @@ $("#batchRun").onclick=async()=>{
  }catch(e){
    toast(e.message);
    await planBatch();
- }finally{batchBusy=false;$("#batchK").disabled=$("#batchFmt").disabled=false}
+ }finally{batchBusy=false;$("#batchK").disabled=$("#batchTier").disabled=false}
 };
 function invalidatePresence(...scopes){
   for(const origin of scopes)presenceRevisions.set(origin,(presenceRevisions.get(origin)??0)+1);
@@ -376,7 +506,8 @@ function nav(){
  $("#tools").hidden=browsing;
  $("#tools label").hidden=inQueue;
  $("#clearQueue").hidden=!inQueue;
- $("#clearQueue").disabled=!jobs.some(j=>!j.active&&["完成","已取消","失败"].includes(j.state));
+ $("#clearQueue").disabled=!jobs.some(j=>!j.active&&!jobAwaitingInput(j)&&["完成","已取消","失败"].includes(j.state));
+ $("#importSettings").hidden=inQueue;
  $("#free").hidden=scope!=="owned";
  $("#add").hidden=scope!=="local";
  bridgeToolbar(scope==="local");
@@ -451,7 +582,7 @@ function updateLibrarySession(session){
    choices.clear();options.clear();variantNotices.clear();
    batchAssets.clear();selecting=false;batchPlan=null;
    claimIdentity="";claimRunning=false;
-   for(const element of document.querySelectorAll("#inspect[open],#claim[open],#batch[open],#fabFiles[open]"))element.close();
+   for(const element of document.querySelectorAll("#inspect[open],#claim[open],#batch[open],#fabFiles[open],#variantConfirm[open]"))element.close();
    $("#menu").hidePopover();
    $("#free").textContent=tr("一键免费入库");
  }
@@ -906,67 +1037,73 @@ async function findCompletedLocalAsset(uid,view){
   if(view.initial)view.localCompletions.set(uid,asset);
   else addCompletedLocalAsset(view,asset);
 }
-function selection(a){if(!choices.has(a.uid)){const v=a.local[0];choices.set(a.uid,{k:v?.k||2,fmt:v?.fmt||(a.kind==="3d-model"?"FBX":"贴图")})}return choices.get(a.uid)}
+function selection(a){
+  const chosen=choices.get(a.uid);
+  if(a.kind==="3d-model"){
+    const preset=chosen?.modelTier||importPreferences.modelTier;
+    return {k:presetTextureSize[preset],modelTier:preset,preset};
+  }
+  const measured=a.local?.[0]?.dimensions;
+  const first=measured?.length===1?Math.max(...measured[0])/1024:2;
+  return {k:chosen?.k||([1,2,4,8].includes(first)?first:2)};
+}
 function preferredFile(files,selected){
- const candidates=files.filter(file=>file.fmt===selected.fmt);
  function distance(file){
    if(file.dimensions?.length)return Math.min(...file.dimensions.map(pair=>Math.abs(Math.max(...pair)/1024-selected.k)));
-   return file.k?Math.abs(file.k-selected.k):Infinity;
+   return Infinity;
  }
- return candidates.sort((a,b)=>distance(a)-distance(b))[0];
+ return [...files].sort((a,b)=>distance(a)-distance(b)||Number(b.fmt==="FBX")-Number(a.fmt==="FBX"))[0];
 }
 function cachedCopy(a,selected){return preferredFile(a.local,selected)}
-function importFromCard(a,selected){
- if(scope==="local"||a.localOnly)return true;
- return a.local.some(file=>file.fmt===selected.fmt && file.dimensions?.some(pair=>Math.max(...pair)===selected.k*1024));
+function cardAction(a,selected){
+  if(a.localOnly||a.local.some(file=>file.dimensions?.some(pair=>Math.max(...pair)===selected.k*1024)))return "导入";
+  if(!a.local.length&&options.get(a.uid)?.length)return "下载并导入";
+  return "获取并导入";
 }
-function chooseVariant(asset,{k,fmt}){
- choices.set(asset.uid,{k,fmt});
+function chooseVariant(asset,{k,modelTier}){
+  choices.set(asset.uid,{k,modelTier});
   tiles.get(asset.uid)?.refreshActions?.();
 }
 async function availableFiles(asset){
- if(!options.has(asset.uid))options.set(asset.uid,await rpc("options",{uid:asset.uid}));
- return options.get(asset.uid);
+ if(options.has(asset.uid))return options.get(asset.uid);
+ const before=version;
+ const files=await rpc("options",{uid:asset.uid});
+ if(before===version){
+   options.set(asset.uid,files);
+   tiles.get(asset.uid)?.refreshActions?.();
+ }
+ return files;
 }
-function variantControls(asset,photo,actions){
- const levels=el("div","levels"), format=el("select");
- levels.role="group";
- levels.ariaLabel=levels.title=tr("首选贴图尺寸");
- format.ariaLabel=tr("文件格式");
- format.onchange=()=>chooseVariant(asset,{k:selection(asset).k,fmt:format.value});
- photo.append(levels);actions.append(format);
- return ()=>{
-   const selected=selection(asset);
-   const known=[...asset.local,...(options.get(asset.uid)||[])];
-   const sizes=[...new Set([1,2,4,8,...known.map(file=>file.k),selected.k].filter(Boolean))];
-   sizes.sort((a,b)=>(a||Infinity)-(b||Infinity));
-   if(sizes.length!==levels.children.length||sizes.some((k,i)=>Number(levels.children[i].dataset.k)!==k)){
-     levels.replaceChildren(...sizes.map(k=>{
-       const option=button(k?k+"K":"原始文件",()=>{
-         const current=selection(asset);
-         if(k===current.k)return;
-         const next={k,fmt:current.fmt};
-         chooseVariant(asset,next);
-       });
-       option.dataset.k=k;
-       option.title=tr("首选贴图尺寸")+" · "+k+"K";
-       return option;
-     }));
-   }
-   for(const option of levels.children){
-     const active=Number(option.dataset.k)===selected.k;
-     option.classList.toggle("chosen",active);
-     option.setAttribute("aria-pressed",String(active));
-   }
-   const defaults=asset.localOnly?[]:asset.kind==="3d-model"?["FBX","GLB"]:["贴图"];
-   const formats=[...new Set([...defaults,...known.map(file=>file.fmt),selected.fmt])];
-   if(formats.length!==format.options.length||formats.some((fmt,i)=>format.options[i].value!==fmt)){
-     format.replaceChildren(...formats.map(fmt=>{
-       const option=el("option",null,fmt);option.value=fmt;return option;
-     }));
-   }
-   format.value=selected.fmt;
- };
+function variantControls(asset,photo){
+  const model=asset.kind==="3d-model";
+  const levels=el("div",model?"levels mesh-levels":"levels");
+  levels.role="group";
+  levels.ariaLabel=levels.title=tr(model?"模型预设":"首选贴图尺寸");
+  if(model){
+    for(const [preset,label] of Object.entries(meshPresets)){
+      const item=button(label,()=>chooseVariant(asset,{modelTier:preset}));
+      item.dataset.variant=preset;
+      item.title=tr(meshTiers[preset])+" · "+presetTextureSize[preset]+"K";
+      levels.append(item);
+    }
+  }else{
+    for(const k of [1,2,4,8]){
+      const item=button(k+"K",()=>chooseVariant(asset,{k}));
+      item.dataset.variant=k;
+      item.title=levels.title+" · "+k+"K";
+      levels.append(item);
+    }
+  }
+  photo.append(levels);
+  return ()=>{
+    const selected=selection(asset);
+    const active=String(model?selected.preset:selected.k);
+    for(const item of levels.children){
+      const chosen=item.dataset.variant===active;
+      item.classList.toggle("chosen",chosen);
+      item.setAttribute("aria-pressed",String(chosen));
+    }
+  };
 }
 function coverURL(url){return location.protocol==="fabshelf:"?url.replace(/^https:\/\/covers\.invalid\//,"fabshelf://covers/"):url}
 const coverRequests=new Map();
@@ -1094,6 +1231,8 @@ function card(a,preview=false,previous){
  star.setAttribute("aria-pressed",String(a.favorite));star.title=tr(a.favorite?"取消收藏":"收藏");photo.append(star);
  const gear=button("⋯",()=>inspectAsset(a,img),"options");gear.title=gear.ariaLabel=tr("规格与导入选项");photo.append(gear);
  if(a.bridge){
+   node.refreshActions=variantControls(a,photo);
+   node.refreshActions?.();
    const actions=el("div","actions");
    actions.append(button(a.connected?"查看规格":"重新定位",a.connected?()=>inspectAsset(a,img):openBridgeLibrary,"primary"));
    body.append(actions,el("small","texture-info",a.connected?"Bridge 资产":"Bridge 素材库未连接"));
@@ -1108,37 +1247,44 @@ function card(a,preview=false,previous){
  }
  const primary=button("",async()=>{
    const requested=selection(a);
+   const before=version;
    primary.disabled=true;
    try{
-     const result=await transferVariant(a,requested,importFromCard(a,requested));
-     showVariantResult(a.uid,requested,result);
-     if(result.state==="missing"&&node.isConnected&&selection(a)===requested)inspectAsset(a,img,true);
+     const recipe=baseRecipe(a,requested.modelTier);
+     const submit=choice=>transferVariant(a,choice,true,recipe);
+     const result=await submit(requested);
+     if(before!==version||!node.isConnected)return;
+     handleVariantResult(a,requested,result,submit);
+     if(result.state==="missing"&&node.isConnected&&selection(a).k===requested.k&&selection(a).modelTier===requested.modelTier)
+       inspectAsset(a,img,true);
+   }catch(e){
+     if(before===version&&node.isConnected)toast(e.message);
    }finally{primary.disabled=false}
  },"primary");
  const actions=el("div","actions");
  const textureInfo=el("small","texture-info");
- const refreshVariants=variantControls(a,photo,actions);
+ const refreshVariants=variantControls(a,photo);
  actions.append(primary);
  const status=el("button","download-status");status.title=tr("下载队列");
  let visibleJob;
  status.onclick=()=>showQueue(visibleJob?.id);
  node.refreshStatus=()=>{
     const c=selection(a), pending=jobsByUid.get(a.uid)||[];
-   visibleJob=pending.find(j=>j.state==="下载中")||pending.find(j=>j.k===c.k&&j.fmt===c.fmt)||pending[0];
+   visibleJob=pending.find(j=>j.state==="下载中")||pending.find(j=>j.textureK===c.k&&(!j.modelTier||j.modelTier===c.modelTier))||pending[0];
    status.hidden=!visibleJob;
    if(visibleJob){
      const {k,fmt,state,total,done}=visibleJob;
      const percent=state==="下载中"&&total>0?Math.min(99,Math.floor(done*100/total))+"%":"";
-     status.textContent=[k?k+"K":"",tr(fmt),tr(state),percent,pending.length>1?"+"+(pending.length-1):""].filter(Boolean).join(" ");
+      status.textContent=[k?k+"K":"",tr(fmt),tr(jobDisplayState(visibleJob)),percent,pending.length>1?"+"+(pending.length-1):""].filter(Boolean).join(" ");
    }
  };
  node.refreshActions=()=>{
    refreshVariants();
    const selected=selection(a), copy=cachedCopy(a,selected);
    const dims=copy?.dimensions?.map(([w,h])=>w+"×"+h).join(" / ");
-   textureInfo.textContent=tr(variantNotices.get(variantKey(a.uid,selected.fmt,selected.k))
+   textureInfo.textContent=tr(variantNotices.get(variantKey(a.uid,selected.k,selected.modelTier))
      || (dims?"已缓存贴图 "+dims:"贴图尺寸待确认"));
-   primary.textContent=tr(importFromCard(a,selected)?"导入":"下载");
+   primary.textContent=tr(cardAction(a,selected));
    node.refreshStatus();
  };
  node.refreshActions();
@@ -1162,6 +1308,10 @@ function showQueue(id){
  scope="queue";
  load();
 }
+function jobAwaitingInput(job){return Boolean(job.pendingImports)}
+function jobDisplayState(job){
+  return job.pendingImports?"等待导入":job.state;
+}
 function transferSummary(){
  const active=jobs.find(j=>j.state==="下载中"), count=state=>jobs.filter(j=>j.state===state).length;
  const summary=$("#transfer"), bar=summary.querySelector("progress");
@@ -1183,16 +1333,20 @@ $("#clearQueue").onclick=async()=>{
  finally{if(scope==="queue")paintJobs()}
 };
 function paintJobs(){const grid=$("#grid");grid.replaceChildren();$("#empty").textContent=tr(jobs.length?"":"队列为空");
- $("#clearQueue").disabled=!jobs.some(j=>!j.active&&["完成","已取消","失败"].includes(j.state));
+ $("#clearQueue").disabled=!jobs.some(j=>!j.active&&!jobAwaitingInput(j)&&["完成","已取消","失败"].includes(j.state));
  let focused;
  for(const j of jobs){const row=el("div","queue");row.dataset.job=j.id;row.tabIndex=-1;
  if(j.id===queueTarget)focused=row;
  if(j.id===queueLocated)row.classList.add("located");
- row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;p.value=j.done;row.append(p);
- const status=el("small",null,[j.state,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · "));
+ row.append(el("strong",null,j.title));const p=el("progress");p.max=j.total||1;
+ if(!j.pendingImports)p.value=j.done;
+ row.append(p);
+ const state=tr(jobDisplayState(j));
+ const failure=j.failedImports?tr("导入失败")+" "+j.failedImports:"";
+ const status=el("small",null,[state,failure,size(j.done)+" / "+size(j.total),j.speed?size(j.speed)+"/s":"",j.route,j.error,j.notice].filter(Boolean).join(" · "));
  if(j.directory)status.append(" · "+j.directory);
  row.append(status);
- const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",!["完成","已取消"].includes(j.state)],["remove","移除",["完成","已取消","失败"].includes(j.state)&&!j.active]]){
+ const bar=el("div","controls");for(const [action,label,on] of [["next","移到下一项",j.state==="等待"],["pause","暂停",["等待","下载中"].includes(j.state)],["resume","继续",["失败","暂停"].includes(j.state)&&!j.active],["cancel","取消",jobAwaitingInput(j)||!["完成","已取消"].includes(j.state)],["remove","移除",["完成","已取消","失败"].includes(j.state)&&!j.active&&!jobAwaitingInput(j)]]){
  if(on)bar.append(button(label,async()=>{await rpc("control",{job:j.id,action});await poll()}))}
  if(j.directory){
    const folder=button("打开下载目录",async()=>{try{await rpc("openDownloadFolder")}catch(e){toast(e.message)}});
@@ -1215,14 +1369,15 @@ let jobsByUid=new Map(),jobBadges=new Map();
 function updateJobBadges(){
   const byUid=new Map();
   for(const job of jobs){
-    if(job.state==="完成"||job.state==="已取消")continue;
+    if((job.state==="完成"&&!jobAwaitingInput(job))||job.state==="已取消")continue;
     if(!byUid.has(job.uid))byUid.set(job.uid,[]);
     byUid.get(job.uid).push(job);
   }
   jobsByUid=byUid;
   const current=new Map();
   for(const [uid,rows] of byUid){
-    const badge=JSON.stringify(rows.map(({id,k,fmt,state,done,total})=>[id,k,fmt,state,total?Math.floor(done*100/total):0]));
+    const badge=JSON.stringify(rows.map(job=>[job.id,job.k,job.fmt,jobDisplayState(job),
+      job.total?Math.floor(job.done*100/job.total):0]));
     current.set(uid,badge);
     if(jobBadges.get(uid)!==badge)tiles.get(uid)?.refreshStatus?.();
   }
@@ -1242,7 +1397,7 @@ async function poll(){
      if(job.state!=="完成" || completed.has(job.id))continue;
      completed.add(job.id);
      if(job.notice&&job.textureK){
-       variantNotices.set(variantKey(job.uid,job.fmt,job.textureK),job.notice);
+       variantNotices.set(variantKey(job.uid,job.textureK,job.modelTier),job.notice);
        toast(job.title+" · "+job.notice);
      }
      if(job.uid&&!tiles.get(job.uid)?.dataset.preview)changed.add(job.uid);

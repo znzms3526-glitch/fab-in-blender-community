@@ -7,7 +7,7 @@ from unittest.mock import patch
 import bpy
 
 root=Path(os.environ["FAB_TEST_ROOT"]).resolve()
-archive=Path(__file__).resolve().parent/"Fab-in-Blender-Windows.zip"
+archive=Path(os.environ.get("FAB_TEST_ARCHIVE", Path(__file__).resolve().parent/"Fab-in-Blender-Windows.zip"))
 scripts=Path(bpy.utils.user_resource("SCRIPTS",create=True)).resolve()
 assert scripts.is_relative_to(root) and not (scripts/"addons"/"fab_shelf").exists()
 assert Path(bpy.utils.user_resource("CONFIG",create=True)).resolve().is_relative_to(root)

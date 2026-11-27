@@ -8,6 +8,12 @@ Browse Fab from a separate Blender companion window, claim free assets on Fab, o
 
 **[下载 Windows 插件 / Download for Windows](https://github.com/znzms3526-glitch/fab-in-blender-community/releases/latest)** · [使用说明](使用说明.md) · [报告问题 / Report an issue](https://github.com/znzms3526-glitch/fab-in-blender-community/issues)
 
+## 0.15.0 模型精度和贴图
+
+- 3D 模型主卡提供低、中、高三档，默认高。材质和贴花沿用 1K、2K、4K、8K。主按钮会直接导入，按需先下载。详情可手动指定实际文件、LOD 和贴图尺寸，也可以仅下载。
+- 在工具栏打开「导入设置」，可选 AO、高光、凹凸或置换。默认使用原有基础贴图，并开启纹理坐标与 Mapping。Fab ZIP 按整包传输，写入工程的贴图按设置和原材质依赖选择。
+- Fab 工程内切换贴图规格时，只在同源、同材质集、同 LOD 的目标贴图齐全时整套替换。GLB 和 Bridge 资产可在副屏详情选择其他规格重新导入。缺图修复按每张图的实际来源和校验值恢复。
+
 ## 0.14.0 浏览性能
 
 - 「我的 Fab 库」「已下载」和「收藏」向下滚动时自动追加下一批资产。多选可跨批次保留。
@@ -37,9 +43,9 @@ Browse Fab from a separate Blender companion window, claim free assets on Fab, o
 1. 在发布页的 **Assets** 下下载 Windows x64 安装包。保留 ZIP 压缩格式。
 2. 打开 Blender 首选项，在插件菜单选择 **从磁盘安装 / Install from Disk**，选中 ZIP 并启用 **Fab in Blender**。更新已有版本后重启 Blender。
 3. 先保存当前 `.blend`。在 3D 视图按 **N → Fab → 打开我的 Fab 库**，从资产库的「账号」菜单登录。首次打开时，缺少 WebView2 的 Windows 电脑需要联网安装这个组件。
-4. 在「我的库」选择一件资产。选好档位和格式，点「下载」。已有对应文件时，直接点卡片上的「导入」。模型会出现在活动集合的 3D 游标位置。
+4. 在「我的 Fab 库」选一件资产，设置所需的贴图尺寸和可用的模型精度后点「下载」。已有对应文件时，直接点卡片上的「导入」。模型会出现在活动集合的 3D 游标位置。
 
-**Quick start in English.** Download the Windows x64 ZIP under Releases → Assets, install it from disk in Blender Preferences, and enable the add-on. Save your scene and open the library from the 3D Viewport sidebar under **Fab**. Sign in, choose a file format and resolution, download, and click **Import**. Change the gallery language under **设置 → 界面 → 界面语言 → English**.
+**Quick start in English.** Download the Windows x64 ZIP under Releases → Assets, install it from disk in Blender Preferences, and enable the add-on. Save your scene and open the library from the 3D Viewport sidebar under **Fab**. Sign in, choose your preferred texture size and model detail, download, and click **Import**. Change the gallery language under **设置 → 界面 → 界面语言 → English**.
 
 ## 搭场景时可以怎样用
 

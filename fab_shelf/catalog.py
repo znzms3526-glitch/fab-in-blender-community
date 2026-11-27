@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import shutil
 import struct
@@ -9,10 +10,11 @@ import tempfile
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen, Request
 
 from .storage import (MODELS, IMAGES, archive_members, file_lock, file_matches, fs_path, recover_removal,
-                      removing_files, texture_variant_key)
+                      removing_files, safe_member, texture_variant_key)
 
 
 DIMENSION_META_VERSION = 1
@@ -104,14 +106,21 @@ def image_dimensions(stream, suffix=""):
     return None
 
 
-def glb_dimensions(stream, name, *, image_names=None):
+def _glb_document(stream):
     header = stream.read(20)
     if len(header) != 20 or header[:4] != b"glTF":
-        return {}
+        return None, 0
     version, total, length, kind = struct.unpack_from("<IIII", header, 4)
-    if version != 2 or kind != 0x4e4f534a or length > min(16_000_000, total-28):
-        return {}
+    if version != 2 or kind != 0x4e4f534a or length > min(16_000_000, total - 20):
+        return None, 0
     doc = json.loads(stream.read(length))
+    return (doc, total) if isinstance(doc, dict) else (None, 0)
+
+
+def glb_dimensions(stream, name, *, image_names=None):
+    doc, total = _glb_document(stream)
+    if doc is None:
+        return {}
     chunk = stream.read(8)
     if len(chunk) != 8 or chunk[4:] != b"BIN\x00":
         return {}
@@ -238,6 +247,12 @@ SUBPART_RE = re.compile(
 LOD_RE = re.compile(r"(?:^|[^a-z0-9])lod(\d+)(?:[^a-z0-9]|$)", re.I)
 TITLE_STOP = {"free", "pack", "asset", "model", "models", "3d", "fbx", "glb", "rigged", "nonrigged", "game", "ready", "lowpoly", "highpoly", "pbr"}
 MODEL_VARIANTS = {"rigged", "nonrigged", "unrigged", "fbx", "glb"}
+_MESH_TAGS = {"low", "lowpoly", "mid", "medium", "high", "highpoly", "raw", "cinematic", "nanite"}
+_HEIGHT_ROLES = ("Bump", "Height", "Displacement")
+_DEFAULT_ROLES = {"Base Color", "Normal", "Roughness", "Metallic", "Alpha"}
+_ORM_ROLES = ("AO", "Roughness", "Metallic")
+_FBX_MAGIC = b"Kaydara FBX Binary  \x00\x1a\x00"
+_FBX_METADATA_LIMIT = 256 * 1024 * 1024
 
 
 def member_sizes(blob, name):
@@ -252,7 +267,7 @@ def member_sizes(blob, name):
     return {}
 
 
-def pick_primary_model(models, *, title="", sizes=None):
+def _primary_model(models, title, sizes):
     models = sorted(models)
     if len(models) <= 1:
         return next(iter(models), None)
@@ -262,9 +277,13 @@ def pick_primary_model(models, *, title="", sizes=None):
     }
     size_map = sizes or {}
 
+    def subparts(name):
+        return set(SUBPART_RE.findall(name.casefold())) - title_tokens
+
+    eligible = [name for name in models if not subparts(name)]
+
     def rank(name):
         stem = Path(name).stem.lower()
-        subpart = set(SUBPART_RE.findall(stem)) - title_tokens
         lod_match = LOD_RE.search(stem)
         lod = int(lod_match[1]) if lod_match else 0
         stem_toks = {token for token in re.findall(r"[a-z0-9]+", stem)
@@ -273,15 +292,243 @@ def pick_primary_model(models, *, title="", sizes=None):
         contains_title = bool(title_tokens) and title_tokens <= stem_toks
         title_hits = len(title_tokens & stem_toks)
         byte_size = size_map.get(name, 0)
-        return (not exact_title, not contains_title, bool(subpart), lod, -title_hits, -byte_size, name.lower())
+        return (not exact_title, not contains_title, lod, -title_hits, -byte_size, name.lower())
 
-    return min(models, key=rank)
+    return min(eligible or models, key=rank)
 
 
-def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", sizes=None):
+def geometry_lod(name):
+    path = PurePosixPath(str(name).replace("\\", "/"))
+    for token in (path.stem, *reversed(path.parent.parts)):
+        match = LOD_RE.search(token)
+        if match:
+            return int(match[1])
+    return None
+
+
+def _member_tokens(value):
+    return tuple(token for token in re.findall(r"[a-z0-9]+", value.casefold())
+                 if token not in _MESH_TAGS and not re.fullmatch(r"lod\d+|\d+k", token))
+
+
+def _model_family(path):
+    return (tuple(tokens for folder in path.parent.parts if folder not in MODEL_VARIANTS
+                  and (tokens := _member_tokens(folder))), _member_tokens(path.stem), path.suffix)
+
+
+def model_family_members(models, *, title="", sizes=None):
+    models = list(models)
+    anchor = _primary_model(models, title, sizes)
+    if anchor is None:
+        return []
+    family = _model_family(PurePosixPath(anchor.replace("\\", "/").casefold()))
+    return [member for member in [anchor,*sorted(set(models)-{anchor})]
+            if _model_family(PurePosixPath(member.replace("\\","/").casefold()))==family]
+
+
+def model_tier_members(models, *, title="", sizes=None):
+    members=model_family_members(models,title=title,sizes=sizes)
+    if not members:
+        return {}
+    anchor=members[0]
+    levels = {}
+    unlabeled = []
+    for member in members:
+        path = PurePosixPath(member.replace("\\", "/").casefold())
+        lod = geometry_lod(path)
+        if lod is not None:
+            levels.setdefault(lod, member)
+            continue
+        tags = set(re.findall(r"[a-z0-9]+", path.as_posix()))
+        if tags & {"low", "lowpoly"}:
+            levels.setdefault(10_000, member)
+        elif tags & {"mid", "medium"}:
+            levels.setdefault(2, member)
+        elif tags & {"high", "highpoly", "raw", "cinematic", "nanite"}:
+            levels.setdefault(0, member)
+        else:
+            unlabeled.append(member)
+    if levels and unlabeled:
+        levels.setdefault(0, unlabeled[0])
+    if len(levels) < 2:
+        return dict.fromkeys(("high", "medium", "low"), anchor)
+    ranked = sorted(levels)
+    middle = ranked[len(ranked) // 2]
+    if len(ranked) >= 3:
+        interior = ranked[1:-1]
+        middle = min(interior, key=lambda level: (level not in (1, 2), abs(level - middle), level))
+    return dict(high=levels[ranked[0]], medium=levels[middle], low=levels[ranked[-1]])
+
+
+def pick_primary_model(models, *, title="", sizes=None, model_tier="high"):
+    return model_tier_members(models, title=title, sizes=sizes).get(model_tier)
+
+
+def _fbx_image_references(stream, limit):
+    if stream.read(len(_FBX_MAGIC)) != _FBX_MAGIC:
+        return ()
+    version_data = stream.read(4)
+    if len(version_data) != 4:
+        return ()
+    header = struct.Struct("<QQQB" if struct.unpack("<I", version_data)[0] >= 7500 else "<IIIB")
+    references, embedded = set(), set()
+
+    def collect(end, depth):
+        found = set()
+        content = False
+        while stream.tell() < end:
+            raw = stream.read(header.size)
+            if len(raw) != header.size:
+                break
+            node_end, properties, property_bytes, name_length = header.unpack(raw)
+            if node_end == 0:
+                break
+            if not stream.tell() + name_length + property_bytes <= node_end <= end:
+                raise ValueError("无效的 FBX 节点边界")
+            name = stream.read(name_length)
+            property_end = stream.tell() + property_bytes
+            if depth == 2 and properties and property_bytes >= 5:
+                type_code = stream.read(1)
+                length = struct.unpack("<I", stream.read(4))[0]
+                if name in (b"FileName", b"Filename", b"RelativeFilename") and type_code == b"S" and (
+                        0 < length <= 4096 and stream.tell() + length <= property_end):
+                    found.add(stream.read(length).decode("utf8", errors="replace").strip("\x00"))
+                elif name == b"Content" and type_code == b"R" and length and stream.tell() + length <= property_end:
+                    content = True
+            elif name in ((b"Objects",) if depth == 0 else (b"Video", b"Texture") if depth == 1 else ()):
+                stream.seek(property_end)
+                sub_refs, sub_content = collect(node_end, depth + 1)
+                if depth == 1:
+                    (embedded if sub_content else references).update(sub_refs)
+            stream.seek(node_end)
+        return found, content
+
+    collect(limit, 0)
+    return references - embedded
+
+
+@contextmanager
+def _model_stream(blob, model_member):
+    path = fs_path(blob)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive, archive_members(archive, {model_member}) as entries:
+            owner, info = entries[model_member]
+            with owner.open(info) as stream:
+                yield stream, info.file_size
+    else:
+        with path.open("rb") as stream:
+            yield stream, os.fstat(stream.fileno()).st_size
+
+
+def _image_members(names):
+    images = {}
+    for member in names:
+        if Path(member).suffix.lower() not in IMAGES:
+            continue
+        try:
+            normalized = safe_member(member).as_posix().casefold()
+        except ValueError:
+            continue
+        images.setdefault(normalized, []).append(member)
+    return images
+
+
+def fbx_original_files(blob, package_name, model_member, names):
+    if not model_member or PurePosixPath(model_member).suffix.lower() != ".fbx":
+        return []
+    images = _image_members(names)
+    if not images:
+        return []
+    try:
+        with _model_stream(blob, model_member) as (stream, size):
+            if size > _FBX_METADATA_LIMIT:
+                return []
+            references = _fbx_image_references(stream, size)
+    except (OSError, KeyError, ValueError, EOFError, RuntimeError, struct.error, zipfile.BadZipFile):
+        return []
+    parent = PurePosixPath(model_member.replace("\\", "/").casefold()).parent.as_posix()
+    chosen = set()
+    for ref in references:
+        name = ref.replace("\\", "/").casefold()
+        relative = posixpath.normpath(posixpath.join(parent, name))
+        basename = PurePosixPath(name).name
+        exact = images.get(relative) or images.get(name)
+        matches = exact or [member for path, members in images.items()
+                            if PurePosixPath(path).name == basename for member in members]
+        if len(matches) == 1:
+            chosen.add(matches[0])
+    return sorted(chosen)
+
+
+def glb_original_files(blob, package_name, model_member, names):
+    if not model_member or PurePosixPath(model_member).suffix.lower() != ".glb":
+        return []
+    images = _image_members(names)
+    if not images:
+        return []
+    try:
+        with _model_stream(blob, model_member) as (stream, _):
+            doc, _ = _glb_document(stream)
+    except (OSError, KeyError, ValueError, EOFError, RuntimeError, zipfile.BadZipFile):
+        return []
+    materials = doc.get("images", ()) if doc else ()
+    if not isinstance(materials, (list, tuple)):
+        return []
+    parent = PurePosixPath(model_member.replace("\\", "/").casefold()).parent.as_posix()
+    chosen = set()
+    for image in materials:
+        uri = image.get("uri") if isinstance(image, dict) else None
+        if not isinstance(uri, str):
+            continue
+        try:
+            target = urlsplit(uri)
+        except ValueError:
+            continue
+        if target.scheme or target.netloc or target.query or target.fragment:
+            continue
+        path = unquote(target.path).replace("\\", "/").casefold()
+        if not path or path.startswith("/"):
+            continue
+        member = posixpath.normpath(posixpath.join(parent, path))
+        matches = images.get(member, ())
+        if len(matches) == 1:
+            chosen.add(matches[0])
+    return sorted(chosen)
+
+
+class AmbiguousTextureSelection(ValueError):
+    """The package offers multiple plausible files and needs a manual selection."""
+
+
+def enabled_texture_roles(channels, height_mode):
+    roles = set(channels) - {"Height"}
+    if "Height" in channels:
+        if height_mode == "bump":
+            roles.update(_HEIGHT_ROLES)
+        elif height_mode == "displacement":
+            roles.update(("Displacement", "Height"))
+    if roles.intersection(_ORM_ROLES):
+        roles.add("ORM")
+    return roles
+
+
+def filter_texture_files(names, role, *, channels, height_mode):
+    allowed = enabled_texture_roles(channels, height_mode)
+    images = {name: role(Path(name)) for name in names if Path(name).suffix.lower() in IMAGES}
+    present = set(images.values()) & allowed
+    height_order = ("Displacement", "Height") if height_mode == "displacement" else _HEIGHT_ROLES
+    height_role = next((key for key in height_order if key in present), None)
+    if not any(key in channels and key not in present for key in _ORM_ROLES):
+        allowed.discard("ORM")
+    allowed.difference_update(key for key in _HEIGHT_ROLES if key != height_role)
+    return [name for name, key in images.items() if key in allowed]
+
+
+def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", sizes=None,
+                  model_tier="high", channels=None, height_mode="off", texture_set=None):
     goal = {"LIGHT":1,"STANDARD":2,"HIGH":4}.get(tier, tier)
     models = sorted(n for n in names if Path(n).suffix.lower() in MODELS)
-    model = chosen if chosen in models else pick_primary_model(models, title=title, sizes=sizes)
+    model = chosen if chosen in models else pick_primary_model(models, title=title, sizes=sizes, model_tier=model_tier)
     selected = [model] if model else []
     def stem_tokens(path):
         return {token for token in re.findall(r"[a-z0-9]+", path.stem.lower())
@@ -294,7 +541,8 @@ def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", 
     families = {path: stem_tokens(path) for path in model_paths}
     selected_model = member_path(model) if model else None
     def model_family(path):
-        parts = tuple(part for part in path.parent.parts if part not in MODEL_VARIANTS)
+        parts = tuple(tokens for part in path.parent.parts if part not in MODEL_VARIANTS
+                      and (tokens := _member_tokens(part)))
         return parts, frozenset(families[path] - MODEL_VARIANTS)
 
     identities = {path: model_family(path) for path in model_paths}
@@ -323,25 +571,40 @@ def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", 
                 return False
         return True
 
-    groups = {}
+    selected_lod = geometry_lod(model) if model else None
+    candidates = []
     for n in names:
         if Path(n).suffix.lower() not in IMAGES or not matches_model(n):
             continue
+        texture_lod = geometry_lod(n)
+        if texture_lod is not None and selected_lod is not None and texture_lod != selected_lod:
+            continue
+        candidates.append(n)
+    groups = {}
+    for n in filter_texture_files(candidates, role, channels=_DEFAULT_ROLES if channels is None else channels,
+                                  height_mode=height_mode):
         key = role(Path(n))
-        if key and key!="Height":
-            if selected_model:
-                # Separate material maps can have the same PBR role. Keep one size per map.
-                key = key, texture_variant_key(member_path(n))
-            groups.setdefault(key,[]).append(n)
+        if selected_model and channels is None:
+            # Separate material maps can have the same PBR role. Keep one size per map.
+            key = key, texture_variant_key(member_path(n))
+        groups.setdefault(key, []).append(n)
     def rank(n):
         pixels = (dimensions or {}).get(n)
         level = max(pixels) / 1024 if pixels else size(n)
         overlap = len(families[selected_model] & stem_tokens(member_path(n))) if selected_model else 0
-        return (abs(level-goal) if level else float("inf"), -overlap, n)
-    for group in groups.values():
-        selected.append(min(group, key=rank))
-    if not selected and len(names)==1:
-        selected=list(names)
+        lod = geometry_lod(n)
+        return (abs(level-goal) if level else float("inf"),
+                0 if selected_lod is not None and lod == selected_lod else 1 if lod is None else 2, -overlap, n)
+    for key, group in groups.items():
+        channel = key[0] if isinstance(key, tuple) else key
+        ordered = sorted(group, key=rank)
+        if channels is not None and len(ordered) > 1 and rank(ordered[0])[:-1] == rank(ordered[1])[:-1]:
+            raise AmbiguousTextureSelection("同一通道存在多个同档贴图，请在详情中手动选择：" + channel)
+        selected.append(ordered[0])
+    if texture_set is not None and not model and len({texture_set(member_path(name)) for name in selected}) > 1:
+        raise AmbiguousTextureSelection("包内贴图来自不同材质套，请在详情中手动选择")
+    if not selected and channels is None and len(names) == 1 and role(Path(names[0])) is None:
+        selected = list(names)
     return selected
 
 
@@ -461,7 +724,7 @@ def delete_package_record(cache, digest, uid, favorite=None):
                 if not re.fullmatch(rf"{digest}(?:-[a-f0-9]{{64}})?", file.stem):
                     continue
                 path = records / file.name
-                prior = json.loads(file.read_text(encoding="utf-8-sig"))
+                prior = json.loads(fs_path(file).read_text(encoding="utf-8-sig"))
                 if not isinstance(prior, dict) or prior.get("hash") != digest:
                     raise ValueError("缓存索引无效")
                 (removed if (prior.get("uid") or "") == uid else survivors).append((path, prior))

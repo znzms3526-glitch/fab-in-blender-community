@@ -148,14 +148,21 @@ def locate(library, target):
 
 def build(cache, request, output):
     import bpy
-    from fab_shelf import scene, storage
+    from fab_shelf import project_assets, scene, storage
 
     if request["mode"] not in (0, 1):
         raise ValueError("Blender 资产库支持静态模型和 PBR 材质")
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
-    paths = storage.stage(cache, output.parent / "files", request, project_layout=False)
-    source = request["source"].copy()
+    originals = request.get("originalFiles", ())
+    members = list(dict.fromkeys([*request["files"], *originals]))
+    checks = {}
+    paths = storage.stage(cache, output.parent / "files", dict(request, files=members),
+                          project_layout=False, checks=checks)
+    staged = dict(zip(members, paths))
+    selected = [staged[member] for member in request["files"]]
+    source = project_assets.model_source(request["source"].copy(), request["files"])
+    recipe = request.get("recipe")
     verified_size = scene.expected_texture_size(source)
     uid = source.get("uid")
     if uid:
@@ -164,7 +171,8 @@ def build(cache, request, output):
     title, label, spec = asset_labels(request)
     fmt = source.get("fmt", "")
     if request["mode"] == 0:
-        objects = scene.import_files(bpy.context, paths, 0, title, texture_size=verified_size)
+        objects = scene.import_files(bpy.context, selected, 0, title, texture_size=verified_size,
+                                     recipe=recipe, original_images=tuple(staged[member] for member in originals))
         if (not any(obj.type == "MESH" for obj in objects)
                 or any(obj.type not in {"MESH", "EMPTY"} or obj.animation_data for obj in objects)
                 or bpy.data.actions):
@@ -181,26 +189,32 @@ def build(cache, request, output):
                         previous.objects.unlink(obj)
     else:
         objects = []
-        asset = scene.build_material(title, paths, False)
+        asset = scene.build_material(title, selected, False, recipe=recipe)
         scene.require_texture_size([asset], verified_size)
 
     tag = json.dumps(source, ensure_ascii=True)
     for block in [*objects, *bpy.data.materials, asset]:
         block["fab_source"] = tag
-    members = {storage.resolved_path(path): name for path, name in zip(paths, request["files"])}
+    if effective_recipe := project_assets.material_recipe(request):
+        for mat in bpy.data.materials:
+            mat["fab_recipe"] = json.dumps(effective_recipe, sort_keys=True)
+    members_by_location = {storage.resolved_path(path): member for member, path in staged.items()}
     for image in bpy.data.images:
-        if not image.users or image.source != "FILE" or image.packed_file:
+        if not image.users or image.source != "FILE":
             continue
         location = storage.resolved_path(bpy.path.abspath(image.filepath))
-        if location not in members or not storage.fs_path(location).is_file():
-            raise ValueError("缺少可打包的贴图 · " + location.name)
-        # Packing in an unsaved worker document needs an absolute source path.
-        image.filepath = str(storage.fs_path(location))
-        image.pack()
+        member = members_by_location.get(location)
         if not image.packed_file:
-            raise ValueError("无法打包贴图 · " + location.name)
-        image.filepath = "//" + location.name
-        image["fab_source"], image["fab_member"] = tag, members[location]
+            if member is None or not storage.fs_path(location).is_file():
+                raise ValueError("缺少可打包的贴图 · " + location.name)
+            # Packing in an unsaved worker document needs an absolute source path.
+            image.filepath = str(storage.fs_path(location))
+            image.pack()
+            if not image.packed_file:
+                raise ValueError("无法打包贴图 · " + location.name)
+            image.filepath = "//" + location.name
+        if member is not None:
+            project_assets._remember_image(image, source, member, checks.get(member))
 
     asset.name = label
     asset.asset_mark()

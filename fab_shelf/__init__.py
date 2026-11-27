@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Fab in Blender · Fab 资产库",
     "author": "Fab Shelf",
-    "version": (0, 14, 4),
+    "version": (0, 15, 0),
     "blender": (4, 1, 1),
     "location": "3D 视图 > N 面板 > Fab",
     "description": "在副屏浏览 Fab，下载资产并导入工程或 Blender 资产库",
@@ -62,6 +62,7 @@ def note(message):
 @persistent
 def close_session(*args):
     global _task, _pool
+    project_assets.rotate_target_runtime()
     if bpy.app.timers.is_registered(finish_runtime_setup):
         bpy.app.timers.unregister(finish_runtime_setup)
     if _pool:
@@ -378,6 +379,22 @@ def viewport():
     return dict(window=win, area=area, region=region)
 
 
+def finish_receive(request, success, error=""):
+    controller = request.get("_queue_controller")
+    receipt = request.get("queueIntent")
+    if not controller or not receipt:
+        return
+    try:
+        controller.finish_import_intent(receipt, success, error)
+    except OSError as issue:
+        note(issue)
+
+
+def receive_pending(request):
+    controller = request.get("_queue_controller")
+    return not controller or controller.import_pending(request["queueIntent"])
+
+
 class FAB_OT_import(bpy.types.Operator):
     bl_idname = "fabshelf.receive"
     bl_label = "导入准备好的 Fab 文件"
@@ -387,24 +404,28 @@ class FAB_OT_import(bpy.types.Operator):
         global _task
         if not _task or not _task.get("paths"):
             return {"CANCELLED"}
-        if context.scene != _session["scene"] or bpy.data.filepath != _task["blend"]:
-            self.report({"ERROR"}, "工程或场景发生改变，请从资产库重新发送")
+        request = _task["request"]
+        if not receive_pending(request):
             _task = None
             return {"CANCELLED"}
-        request = _task["request"]
+        if context.scene != _session["scene"] or bpy.data.filepath != _task["blend"]:
+            message = "工程或场景发生改变，请从资产库重新发送"
+            self.report({"ERROR"}, message)
+            _task = None
+            finish_receive(request, False, message)
+            return {"CANCELLED"}
         ids = {kind:set(getattr(bpy.data,kind)) for kind in ("objects","meshes","materials","images")}
+        success = False
+        error = ""
         try:
             if request.get("action")=="textures":
-                target=request["target"]
-                obj=context.scene.objects.get(target["name"])
-                if not obj or obj.get("fab_target")!=target["id"]:raise ValueError("原目标物体已更改，请重新选择")
-                count=project_assets.upgrade(obj,_task["paths"],request)
-                _session["import_directory"]=imported_directory(obj.active_material,_task["paths"])
-                note(f"已更新 {count} 个贴图节点")
-                return {"FINISHED"}
+                result = apply_texture_upgrade(context, request, _task["paths"])
+                success = "FINISHED" in result
+                return result
             if request.get("action")=="repair":
                 count=project_assets.repair_download(request,_task["paths"])
                 note(f"已恢复 {count} 张工程贴图 · {request['name']}")
+                success = True
                 return {"FINISHED"}
             objs = project_assets.place(context,_task["paths"],request)
             material=next((obj.active_material for obj in objs if obj.active_material),None)
@@ -415,7 +436,9 @@ class FAB_OT_import(bpy.types.Operator):
                 note("已导入活动集合 · "+context.view_layer.active_layer_collection.collection.name)
             else:
                 note("材质已导入 · "+request["name"])
+            success = True
         except Exception as e:
+            error = str(e)
             for kind, previous in ids.items():
                 data = getattr(bpy.data,kind)
                 for item in set(data)-previous:
@@ -426,6 +449,7 @@ class FAB_OT_import(bpy.types.Operator):
             return {"CANCELLED"}
         finally:
             _task = None
+            finish_receive(request, success, error)
         return {"FINISHED"}
 
 
@@ -440,6 +464,7 @@ def target_state(ctx):
 
 def tick():
     global _task, _pool
+    starting = None
     try:
         held=_session.setdefault("held",[])
         box=_session.get("box")
@@ -454,9 +479,15 @@ def tick():
             change = None if switching or stage_busy else controller.take_idle_cache_change()
             for f in sorted(Path(box.name).glob("*.json"),key=lambda p:p.stat().st_mtime_ns):
                 request = json.loads(f.read_text(encoding="utf-8-sig"))
+                if receipt := request.get("queueIntent"):
+                    if not controller.import_pending(receipt):
+                        f.unlink()
+                        continue
+                    request["_queue_controller"] = controller
                 request["cache"] = str(controller.cache)
                 held.append(request)
                 f.unlink()
+            held[:] = [request for request in held if receive_pending(request)]
             sync_project_state()
             if change:
                 begin_cache_switch(controller, change)
@@ -467,6 +498,10 @@ def tick():
                 release_window()
         if _session.get("cache_switch"):
             advance_cache_switch(bpy.context)
+        if _task and not receive_pending(_task["request"]):
+            if _task["future"].done():
+                _task = None
+            return 0.1
         if not _task:
             if not held and not _session.get("proc"):
                 if _session.get("cache_switch"):return .4
@@ -477,7 +512,10 @@ def tick():
                     if _session.get("message")!="请先保存 .blend；保存后将继续导入":note("请先保存 .blend；保存后将继续导入")
                     if not _session.get("proc") and _pool:_pool.shutdown(wait=False);_pool=None
                     return 0.5 if _session.get("proc") or _session.get("cache_switch") else None
-                req=held.pop(0)
+                starting=held.pop(0)
+                req=starting
+                if not receive_pending(req):
+                    return 0.1
                 with bpy.context.temp_override(**viewport()):
                     state = target_state(bpy.context)
                 project = Path(bpy.data.filepath).parent
@@ -493,7 +531,10 @@ def tick():
                 else:
                     note("选择已改变。请在 Blender 的 Fab 面板确认导入目标。")
     except Exception as e:
+        failed = _task["request"] if _task else starting
         _task = None
+        if failed:
+            finish_receive(failed, False, str(e))
         note(e)
     if _task and _task.get("paths") and not _session.get("proc") and not _session.get("cache_switch"):
         if _pool:_pool.shutdown(wait=False);_pool=None
@@ -559,25 +600,44 @@ class FAB_OT_upgrade(bpy.types.Operator):
     def draw(self,context):
         self.layout.prop(self,"resolution")
         self.layout.prop(self,"shared")
-        mat=context.active_object.active_material
-        count=sum(any(s.material==mat for s in o.material_slots) for o in bpy.data.objects)
-        self.layout.label(text=f"当前材质由 {count} 个物体使用")
+        if context.active_object and (mat := context.active_object.active_material):
+            count=sum(any(s.material==mat for s in o.material_slots) for o in bpy.data.objects)
+            self.layout.label(text=f"当前材质由 {count} 个物体使用")
 
     def execute(self,context):
         obj=context.active_object
-        src=project_assets.reference(obj.active_material if obj else None)
+        mat = obj.active_material if obj else None
+        src = project_assets.texture_origin(obj, mat)
+        if src.get("bridge"):
+            self.report({"INFO"}, "请在副屏 Bridge 库中直接选择目标分辨率重新导入")
+            return {"CANCELLED"}
         if not bpy.data.filepath or not src.get("uid"):
             self.report({"ERROR"},"请保存工程并选择带 Fab 来源的材质")
             return {"CANCELLED"}
-        import uuid
-        if not obj.get("fab_target"):obj["fab_target"]=uuid.uuid4().hex
-        target=dict(name=obj.name,id=obj["fab_target"],material=obj.active_material.name)
+        fmt = src.get("modelFormat") or src.get("fmt", "贴图")
+        if fmt == "GLB":
+            self.report({"INFO"}, "当前材质来自 GLB。请在详情选择对应规格文件包重新导入，原有材质保持不变")
+            return {"CANCELLED"}
         try:
-            submit_project_requests(context,[dict(uid=src["uid"],source=src,k=int(self.resolution),fmt=src.get("fmt","贴图"),action="textures",target=target,shared=self.shared,**{"import":True})])
+            target = project_assets.capture_texture_target(obj, mat)
+            request = dict(uid=src.get("uid", ""), source=src, k=int(self.resolution), fmt=fmt, action="textures",
+                           target=target, shared=self.shared, **{"import": True})
+            submit_project_requests(context, [request])
         except (OSError, ValueError, RuntimeError) as e:
             self.report({"ERROR"},str(e))
             return {"CANCELLED"}
         return {"FINISHED"}
+
+
+def apply_texture_upgrade(context, request, paths):
+    target = request["target"]
+    obj = context.scene.objects.get(target["name"])
+    if not obj or obj.get("fab_target") != target["id"]:
+        raise ValueError("原目标物体已更改，请重新选择")
+    count = project_assets.upgrade(obj, paths, request)
+    _session["import_directory"] = imported_directory(obj.active_material, paths)
+    note(f"已更新 {count} 个贴图节点")
+    return {"FINISHED"}
 
 
 class FAB_RepairPackage(bpy.types.PropertyGroup):
@@ -770,9 +830,22 @@ class FAB_PT_panel(bpy.types.Panel):
         if src.get("hash"):
             box=col.box()
             box.label(text=("Bridge 来源 · " if src.get("bridge") else "Fab 来源 · ")+(src.get("title") or src["name"]))
-            if src.get("k"):box.label(text=f"来源规格 {src['k']}K")
-            if src.get("uid"):
+            origin = project_assets.texture_origin(obj, material)
+            if model := origin.get("modelMember"):
+                box.label(text=project_text("原始模型", "Original model") + " · " + Path(model).name)
+            if recipe := material.get("fab_recipe"):
+                try:
+                    values = json.loads(recipe)
+                    if "mapping" in values:
+                        mapping = project_text("开", "On") if values["mapping"] else project_text("关", "Off")
+                        box.label(text=project_text("导入配方", "Import recipe") + " · Mapping " + mapping)
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            if src.get("bridge"):
+                box.label(text=project_text("换档请在副屏 Bridge 库重新导入", "Choose another resolution in the Bridge library"))
+            elif src.get("uid") and (origin.get("modelFormat") or origin.get("fmt")) != "GLB":
                 box.operator("fabshelf.upgrade_textures")
+            if src.get("uid"):
                 box.operator("fabshelf.locate",icon="VIEWZOOM")
             folder=project_assets.material_directory(material)
             if folder is None and project_folder:

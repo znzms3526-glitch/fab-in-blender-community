@@ -262,16 +262,22 @@ async function bridgeAssetDetails(asset, target) {
 
     const modelLabel = el("label", "field", asset.kind === "3d-model" ? "模型格式与 LOD" : "本地文件");
     const model = el("select");
+    const preferred = selection(asset);
     for (const choice of result.models) {
       const label = [tr(choice.fmt), choice.lod == null ? "" : "LOD " + choice.lod, choice.name].filter(Boolean);
       const option = el("option", "name", label.join(" · "));
       option.value = choice.id;
       model.append(option);
     }
+    const preferredModel = result.models.find(choice=>choice.modelTiers?.includes(preferred.modelTier) &&
+      choice.sizes.some(size=>size.pixels&&Math.max(...size.pixels)===preferred.k*1024)) ||
+      result.models.find(choice=>choice.modelTiers?.includes(preferred.modelTier));
+    if(preferredModel)model.value=preferredModel.id;
     modelLabel.append(model);
     modelLabel.hidden = asset.kind !== "3d-model" && result.models.length === 1;
     const resolutionLabel = el("label", "field", "贴图分辨率");
     const resolution = el("select");
+    const override = optionalRecipe(asset);
     resolutionLabel.append(resolution);
     model.onchange = () => {
       const previous = resolution.value;
@@ -282,7 +288,10 @@ async function bridgeAssetDetails(asset, target) {
         return option;
       }));
       if (sizes.some(size => size.id === previous)) resolution.value = previous;
-      else if (sizes.some(size => size.id === "2048x2048")) resolution.value = "2048x2048";
+      else {
+        const target=sizes.find(size=>size.pixels&&Math.max(...size.pixels)===preferred.k*1024);
+        if(target)resolution.value=target.id;
+      }
     };
     model.onchange();
 
@@ -292,7 +301,7 @@ async function bridgeAssetDetails(asset, target) {
       for (const control of controls.children) control.disabled = true;
       feedback.textContent = tr(op === "bridgePublish" ? "正在生成 Blender 资产…" : "正在准备 Bridge 文件…");
       try {
-        const response = await rpc(op, { uid: asset.uid, model: model.value, size: resolution.value });
+        const response = await rpc(op, { uid: asset.uid, model: model.value, size: resolution.value,recipe:override.read() });
         if (op === "bridgePublish") {
           const state = response.created ? "已加入 Blender 资产库" :
             response.located ? "已在 Blender 中定位" : "已在 Blender 资产库";
@@ -310,7 +319,7 @@ async function bridgeAssetDetails(asset, target) {
     controls.append(button("导入 Blender", () => submit("bridgeImport"), "primary"));
     if (asset.kind !== "decal") controls.append(button("加入 Blender 资产库", () => submit("bridgePublish")));
     feedback.textContent = "";
-    details.prepend(modelLabel, resolutionLabel, controls);
+    details.prepend(modelLabel, resolutionLabel, override.node, controls);
   } catch (error) {
     feedback.textContent = tr(error.message);
   }

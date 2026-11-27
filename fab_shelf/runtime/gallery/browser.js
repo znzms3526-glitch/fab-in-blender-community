@@ -101,19 +101,20 @@ async function checkFabListing() {
    const dialog=$("#fabFiles"), spec=dialog.querySelector(".specs");
    dialog.querySelector("h2").textContent=result.title;
    spec.replaceChildren();
-   if(result.files.length)renderDownloads(spec,result.files,async requested=>{
+    const asset={uid,kind:result.kind||result.local?.kind||"3d-model"};
+    if(result.files.length)renderDownloads(spec,result.files,async(requested,recipe)=>{
      try{
-       const transfer=await rpc("queueListing",{token:result.token,fmt:requested.fmt,textureK:requested.k});
-       chooseVariant({uid},requested);
-       showVariantResult(uid,requested,transfer);
+       const submit=choice=>rpc("queueListing",{token:result.token,selection:selectionRequest(choice),recipe});
+       const transfer=await submit(requested);
+       handleVariantResult(asset,requested,transfer,submit);
        status.textContent=tr(transfer.message);
-       if(transfer.state!=="missing")dialog.close();
+       if(transfer.state==="cached"||transfer.state==="queued")dialog.close();
      }catch(e){
        dialog.close();
        action.textContent=tr("重新核对");
        status.textContent=tr(e.message);
      }
-   });
+    },selection(asset),asset);
    if(result.local)spec.append(button("查看已下载",()=>{
      dialog.close();
      showLocalListing(result.local);

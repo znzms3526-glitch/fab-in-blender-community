@@ -250,4 +250,9 @@ class AutomaticRoutes(unittest.TestCase):
 
 
 if __name__=="__main__":
-    unittest.main()
+    args = sys.argv[1:]
+    if "--" in args:
+        args = args[args.index("--") + 1:]
+    elif "-P" in args or "--python" in args:
+        args = []
+    unittest.main(argv=[__file__, *args])

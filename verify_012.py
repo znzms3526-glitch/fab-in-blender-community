@@ -39,7 +39,7 @@ def write_zip_package(cache, name, members, *, uid="", title="", kind="3d-model"
     tmp = packages / f"tmp-{time.time_ns()}.zip"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel, data in members.items():
-            zf.writestr(rel, data)
+            zf.writestr(zipfile.ZipInfo(rel), data, compress_type=zipfile.ZIP_DEFLATED)
     digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
     blob = packages / digest
     if not blob.exists():
@@ -400,7 +400,7 @@ def test_queue_clear_and_remove(tmp):
 
 
 def test_delete_local_shared_and_unshared(tmp):
-    cache = tmp / "del_cache"
+    cache = deep_directory(tmp, "del_cache", 142) if os.name == "nt" else tmp / "del_cache"
     box = tmp / "del_box"
     box.mkdir(parents=True, exist_ok=True)
     g = make_test_gallery(cache, box)
@@ -408,6 +408,10 @@ def test_delete_local_shared_and_unshared(tmp):
     # 1. Unshared package
     rec1 = write_zip_package(cache, "solo.zip", {"a.png": png_bytes()}, uid="uid-solo", title="Solo", kind="material")
     g.record_local(rec1)
+    alias = cache / "records" / f'{rec1["hash"]}-{hashlib.sha256(b"uid-solo").hexdigest()}.json'
+    assert storage.fs_path(alias).is_file()
+    if os.name == "nt":
+        assert storage.needs_extended_path(alias)
     (cache / "records" / f"{rec1['hash']}.gallery").write_text('{"files":["a.png"],"mode":1}', encoding="utf8")
 
     res = g.handle({"op": "deleteLocal", "hash": rec1["hash"], "uid": "uid-solo"})
@@ -473,7 +477,7 @@ def test_cache_recovery(tmp):
     rec = write_zip_package(cache, "model.zip", {"Model.fbx": b"Model"}, uid="legacy")
     digest = rec["hash"]
     canonical = cache / "records" / (digest + ".json")
-    scoped = cache / "records" / (digest + "-" + hashlib.sha256(b"legacy").hexdigest() + ".json")
+    scoped = storage.fs_path(cache / "records" / (digest + "-" + hashlib.sha256(b"legacy").hexdigest() + ".json"))
     blob = cache / "packages" / digest
     remove = {"op": "deleteLocal", "hash": digest, "uid": "legacy"}
 

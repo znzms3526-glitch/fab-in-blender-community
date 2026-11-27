@@ -82,9 +82,32 @@ main:has(> #localSources:not([hidden])):has(> #bridgeBanner:not([hidden])){grid-
 .bridge-specs .field{display:grid;gap:6px;margin:0 0 10px}
 .bridge-specs select{width:100%;min-width:0}
 .card .primary{min-width:68px}
+.photo .mesh-levels button{min-width:24px}
+.channel-picker{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;border:1px solid var(--line);border-radius:6px;margin:0;padding:9px}
+.channel-picker label,.recipe-controls label{display:flex;align-items:center;gap:6px}
+.channel-picker input,.recipe-controls input{accent-color:var(--accent)}
+.bridge-import-options{display:grid;gap:10px}
+.bridge-import-options fieldset{min-width:0}
+.import-node-settings,.import-preset-settings{margin:0;padding:9px;border:1px solid var(--line);border-radius:6px}
+.import-height-options{grid-column:1/-1}
+.import-height-options[hidden]{display:none}
+.import-preset-options{display:flex;gap:12px;flex-wrap:wrap}
+.import-preset-options label,#preferences .import-preset-options label{display:flex;align-items:center;gap:4px;margin:0}
+#preferences .import-preset-options input[type=radio]{width:auto;margin:0;padding:0;accent-color:var(--accent)}
+.import-form-note{color:var(--muted);line-height:1.45}
+.recipe-controls,.import-override,#variantAlternatives,#batchConfirmations{display:grid;gap:8px}
+.import-override{margin:9px 0}
+.import-override[open]>*+*{margin-top:7px}
+.variant-alternative{text-align:left;width:100%;overflow-wrap:anywhere}
+#variantConfirm,#importSettingsPanel{color:inherit;background:#202328;border:1px solid var(--line);border-radius:12px}
+#variantConfirm{max-width:min(680px,92vw);max-height:88vh;padding:0}
+#variantConfirm header{justify-content:space-between}
+#variantConfirm h2{font-size:18px;margin:0}
+#importSettingsPanel{inset:20px 20px auto auto;margin:0;padding:14px;width:min(430px,calc(100vw - 40px));max-height:calc(100vh - 40px);overflow:auto}
+#importSettingsPanel>*,#importSettingsPage>*{margin-bottom:8px}
+#batchConfirmations label{margin-left:0}
 .batch-pick{inset:7px 43px auto auto;margin:3px 1px;z-index:1}
 .card .actions{margin-top:0;flex-wrap:wrap;gap:6px}
-.card .actions select{min-width:0;max-width:100%;flex:0 1 auto}
 .queue:focus,.queue.located{outline:2px solid var(--accent);outline-offset:-2px}
 .browsing{grid-template-rows:auto minmax(0,1fr)}
 .browsing #saveHint{display:none}

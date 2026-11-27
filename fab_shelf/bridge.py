@@ -17,6 +17,7 @@ from .scene import role
 
 
 INDEX_NAME = "bridge-library.json"
+SCAN_VERSION = 2
 KINDS = {"3d": "3d-model", "3dplant": "3d-model", "surface": "material",
          "atlas": "material", "decal": "decal"}
 UNSUPPORTED = {".uasset", ".obj", ".abc", ".gltf", ".usd", ".usdz"}
@@ -30,9 +31,11 @@ def read_index(path):
         data = json.loads(storage.fs_path(path).read_text(encoding="utf8"))
         if (data["version"] == 1 and isinstance(data["records"], dict)
                 and isinstance(data["root"], str) and isinstance(data["revision"], str)):
+            if type(data.get("scanVersion")) is not int:
+                data["scanVersion"] = 1
             return data
     except FileNotFoundError:
-        return dict(version=1, revision="", root="", records={})
+        return dict(version=1, scanVersion=SCAN_VERSION, revision="", root="", records={})
     except (ValueError, KeyError, TypeError):
         pass
     raise ValueError("无法读取 Bridge 素材库索引")
@@ -94,8 +97,10 @@ def asset_record(root, manifest, previous, check_cancel):
     entries = [folder / name for name in os.listdir(storage.fs_path(folder))]
     siblings = {os.path.normcase(item.name): item.name for item in entries}
     candidates = {item.name for item in entries if item.stem.casefold().startswith(identifier)}
+    declared = set()
     for field in ("components", "maps", "meshes", "models", "lodList"):
-        candidates.update(member_uris(data.get(field)))
+        declared.update(member_uris(data.get(field)))
+    candidates.update(declared)
     members, dimensions, image_names = {}, {}, {}
     prior_dimensions = defaultdict(dict)
     for name, size in previous.get("dimensions", {}).items():
@@ -113,7 +118,7 @@ def asset_record(root, manifest, previous, check_cancel):
             key = relative.as_posix()
             if key in members:
                 continue
-            if suffix in storage.IMAGES and (role(relative) in (None, "Height")
+            if suffix in storage.IMAGES and ((role(relative) is None and (kind != "3d-model" or name not in declared))
                     or re.search(r"(?:^|[_-])(preview|thumb|render)(?:[_-]|$)", relative.stem, re.I)
                     or any(p.lower() in SKIP_FOLDERS for p in relative.parts[:-1])):
                 continue
@@ -174,8 +179,17 @@ def asset_record(root, manifest, previous, check_cancel):
 
 
 def model_lod(name):
-    match = re.search(r"(?:^|[_ .-])lod(\d+)(?:$|[_ .-])", Path(name).stem, re.I)
-    return int(match[1]) if match else None
+    return catalog.geometry_lod(name)
+
+
+def model_tiers(record, model):
+    if not model:
+        return []
+    suffix = Path(model).suffix.lower()
+    sizes = {name: stamp[0] for name, stamp in record["members"].items() if Path(name).suffix.lower() == suffix}
+    tiers = catalog.model_tier_members(sizes, title=record["title"], sizes=sizes)
+    return ([tier for tier in ("high", "low", "medium") if tiers.get(tier) == model]
+            if len(set(tiers.values())) > 1 else [])
 
 
 def variant_plans(record, model):
@@ -241,6 +255,7 @@ class BridgeLibrary:
         self.progress = dict(state="idle")
         self.index = None
         self.stamp = None
+        self.upgrade_revision = None
 
     def index_stamp(self):
         try:
@@ -268,11 +283,20 @@ class BridgeLibrary:
     def status(self):
         with self.lock:
             index = self.snapshot()
+            available = connected(index["root"])
+            needs_scan = bool(index["root"] and index["scanVersion"] < SCAN_VERSION)
+            if needs_scan and not available:
+                self.upgrade_revision = None
+            if (needs_scan and available and not self.running and not self.stop.is_set()
+                    and self.upgrade_revision != index["revision"]):
+                self.upgrade_revision = index["revision"]
+                self.start(migration=True)
             progress = dict(self.progress)
-        return dict(progress, revision=index["revision"], path=index["root"], connected=connected(index["root"]),
+        return dict(progress, revision=index["revision"], path=index["root"], connected=available,
+                    scanVersion=index["scanVersion"], rescanPending=needs_scan,
                     assets=len({row["id"] for row in index["records"].values()}))
 
-    def start(self, path=None, *, relocate=False):
+    def start(self, path=None, *, relocate=False, migration=False):
         with self.lock:
             if self.running:
                 raise ValueError("正在扫描 Bridge 素材库")
@@ -283,7 +307,7 @@ class BridgeLibrary:
             self.cancelled.clear()
             self.progress = dict(state="discovering", target=str(path), found=0, done=0, total=0,
                                  recognized=0, missing=0, unsupported=0, invalid=0, skippedItems=[])
-            self.worker = threading.Thread(target=self.scan, args=(Path(path), previous, relocate),
+            self.worker = threading.Thread(target=self.scan, args=(Path(path), previous, relocate, migration),
                                            name="FabBridgeScan", daemon=True)
             self.worker.start()
             return dict(self.progress)
@@ -307,12 +331,12 @@ class BridgeLibrary:
             if read_index(self.path)["revision"] != previous["revision"]:
                 raise ValueError("Bridge 素材库已在另一个窗口更新，请重试")
             self.check_cancel()
-            current = dict(version=1, revision=uuid.uuid4().hex, root=root,
+            current = dict(version=1, scanVersion=SCAN_VERSION, revision=uuid.uuid4().hex, root=root,
                            roots=[root] if root else [], records=records)
             catalog.atomic_json(self.path, current)
             self.index, self.stamp = current, self.index_stamp()
 
-    def scan(self, selected, previous, relocate):
+    def scan(self, selected, previous, relocate, migration=False):
         try:
             if not connected(selected):
                 raise ValueError("Bridge 素材库未连接")
@@ -370,6 +394,8 @@ class BridgeLibrary:
                 raise ValueError("Bridge 素材库未连接")
             if not records and (str(root) != previous["root"] or self.progress["invalid"]):
                 raise ValueError("未找到可导入的 Bridge 资产")
+            if migration and (self.progress["invalid"] or previous["records"].keys() - records.keys()):
+                raise ValueError("部分 Bridge 资产无法重新扫描，已保留原索引")
             if relocate and previous["records"] and not (
                 {row["id"] for row in records.values()} & {row["id"] for row in previous["records"].values()}
             ):
@@ -433,16 +459,19 @@ class BridgeLibrary:
     def detail(self, uid):
         index = self.snapshot()
         available = connected(index["root"])
-        return dict(connected=available, models=[
-            dict(id=choice, fmt=Path(model).suffix[1:].upper() if model else "贴图",
-                 lod=model_lod(model) if model else None, name=Path(model or key).name,
-                 sizes=[dict(id=size, pixels=pixels,
-                             label=", ".join(Path(n).name for n in names if n != model) if not pixels else "")
-                        for size, (pixels, names) in variants.items()])
-            for choice, (key, _, model, variants) in self.options(uid, index).items()
-        ] if available else [])
+        result = []
+        if available:
+            for choice, (key, record, model, variants) in self.options(uid, index).items():
+                tiers = model_tiers(record, model)
+                result.append(dict(id=choice, fmt=Path(model).suffix[1:].upper() if model else "贴图",
+                                   lod=model_lod(model) if model else None, name=Path(model or key).name,
+                                   modelTier=tiers[0] if tiers else None, modelTiers=tiers,
+                                   sizes=[dict(id=size, pixels=pixels,
+                                               label=", ".join(Path(n).name for n in names if n != model) if not pixels else "")
+                                          for size, (pixels, names) in variants.items()]))
+        return dict(connected=available, models=result)
 
-    def request(self, uid, choice_id, size_id):
+    def request(self, uid, choice_id, size_id, recipe=None):
         index = self.snapshot()
         root = Path(index["root"])
         if not connected(index["root"]):
@@ -452,6 +481,48 @@ class BridgeLibrary:
             pixels, names = variants[size_id]
         except KeyError:
             raise ValueError("此 Bridge 规格已变化，请重新打开详情") from None
+        if recipe is None:
+            return self.request_members(root, key, record, model, pixels, names)
+        dims = record["dimensions"]
+        lod = (model_lod(model) or 0) if model else None
+        textures = [name for name in record["members"]
+                    if Path(name).suffix.lower() in storage.IMAGES and model_lod(name) in (None, lod)
+                    and (tuple(dims.get(name) or ()) == tuple(pixels) if pixels else name in names)]
+        original = []
+        suffix = Path(model).suffix.lower() if model else ""
+        models = [name for name in record["members"] if Path(name).suffix.lower() == suffix] if model else []
+        if model:
+            folder = (root / storage.safe_path(key)).parent
+            model_path = folder / storage.safe_member(model)
+            inspect = catalog.glb_original_files if suffix == ".glb" else catalog.fbx_original_files
+            original = inspect(model_path, Path(model).name, model, record["members"])
+        if suffix == ".glb":
+            selected = [model]
+        else:
+            selected = catalog.default_files([*models, *textures], max(pixels) // 1024 if pixels else 2, role,
+                                             chosen=model, dimensions=dims, title=record["title"],
+                                             channels=recipe["channels"], height_mode=recipe["heightMode"])
+        if not selected:
+            raise ValueError("所选规格没有可用的已启用贴图通道")
+        all_members = list(dict.fromkeys([*selected, *original]))
+        request = self.request_members(root, key, record, model, pixels, all_members)
+        request.update(files=selected, recipe=recipe)
+        if original:
+            request["originalFiles"] = original
+        source = request["source"]
+        sizes = [list(dims[member]) if dims.get(member) else None for member in all_members
+                 if Path(member).suffix.lower() in storage.IMAGES]
+        if suffix == ".glb":
+            sizes.extend(value for name, value in dims.items() if name.startswith(model + "#image-"))
+        source["textureSizes"] = sizes or [None]
+        edges = {max(size) if size else 0 for size in sizes}
+        edge = next(iter(edges)) if len(edges) == 1 else 0
+        source["k"] = edge // 1024 if edge % 1024 == 0 else 0
+        if tiers := model_tiers(record, model):
+            source["modelTier"] = next((tier for tier in tiers if tier == recipe["modelTier"]), tiers[0])
+        return request
+
+    def request_members(self, root, key, record, model, pixels, names):
         folder = (root / storage.safe_path(key)).parent
         checks = {}
         for name in names:
@@ -473,7 +544,10 @@ class BridgeLibrary:
         source = dict(hash=digest, name=name, title=record["title"], kind=record["kind"], uid="",
                       fmt=Path(model).suffix[1:].upper() if model else "贴图",
                       k=edge // 1024 if edge % 1024 == 0 else 0, textureSizes=[pixels], members=names,
-                      quixel_id=record["id"], origin="Bridge", bridge=dict(manifest=key, checks=checks))
+                      quixel_id=record["id"], origin="Bridge", bridge=dict(manifest=key, checks=checks),
+                      modelMember=model or "", bridgeLod=model_lod(model) if model else None)
+        if model:
+            source["modelFormat"] = source["fmt"]
         return dict(hash=digest, name=name, source=source, mode=mode, files=names)
 
     def cover(self, uid):

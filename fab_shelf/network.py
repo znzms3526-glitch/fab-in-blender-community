@@ -21,12 +21,79 @@ from urllib.parse import urlsplit
 from urllib.request import (HTTPHandler, HTTPRedirectHandler, HTTPSHandler, ProxyHandler,
                             Request, build_opener, getproxies, proxy_bypass)
 
+DEFAULT_CHANNELS = ("Base Color", "Normal", "Roughness", "Metallic", "Alpha")
+IMPORT_CHANNELS = (*DEFAULT_CHANNELS, "AO", "Specular", "Height")
+MODEL_TIERS = ("low", "medium", "high")
+HEIGHT_MODES = ("off", "bump", "displacement")
+DEFAULT_IMPORT = dict(channels=DEFAULT_CHANNELS, mapping=True, heightMode="off", modelTier="high")
 DEFAULTS=dict(language="zh-CN",apiRoute="system",fileRoute="system",proxy="",range="quixel",tier="personal",
-              background=True,coverMiB=512)
+              background=True,coverMiB=512,**{"import":DEFAULT_IMPORT})
 LABELS={"system":"跟随系统","direct":"直连","proxy":"指定代理"}
 FILE_LABELS={**LABELS,"auto":"自动选路"}
 API_PROBE="https://www.fab.com/i/taxonomy/listing-types"
 PAC_TTL=10
+
+
+def _import_channels(value):
+    if not isinstance(value, (list, tuple)) or any(channel not in IMPORT_CHANNELS for channel in value):
+        raise ValueError("导入贴图通道无效")
+    return [channel for channel in IMPORT_CHANNELS if channel in value]
+
+
+def _import_options(values):
+    if (type(values["mapping"]) is not bool or values["heightMode"] not in HEIGHT_MODES
+            or values["modelTier"] not in MODEL_TIERS):
+        raise ValueError("导入设置无效")
+    return {key: values[key] for key in ("mapping", "heightMode", "modelTier")}
+
+
+def _import_preferences(values):
+    if not isinstance(values, dict):
+        raise ValueError("导入设置无效")
+    if "channels" in values:
+        channels = _import_channels(values["channels"])
+    else:
+        # A channel disabled in either legacy profile requires a fresh opt-in.
+        model = _import_channels(values.get("modelChannels", DEFAULT_CHANNELS))
+        material = _import_channels(values.get("materialChannels", DEFAULT_CHANNELS))
+        channels = [key for key in model if key in material]
+    options = _import_options({**DEFAULT_IMPORT, **values})
+    return _effective_recipe("material", channels, options)
+
+
+def _effective_recipe(kind, channels, options):
+    if kind == "decal":
+        channels = _import_channels([*channels, "Alpha"])
+        if options["heightMode"] == "displacement":
+            options["heightMode"] = "bump"
+    if "Height" not in channels:
+        options["heightMode"] = "off"
+    elif options["heightMode"] == "off":
+        channels.remove("Height")
+    return dict(channels=channels, **options)
+
+
+def import_recipe(settings, kind, override=None):
+    preferences = settings.get("import", DEFAULT_IMPORT)
+    if "channels" not in preferences:
+        preferences = _import_preferences(preferences)
+    default = preferences["channels"]
+    if override is not None and not isinstance(override, dict):
+        raise ValueError("导入设置无效")
+    chosen = override or {}
+    channels = _import_channels(chosen.get("channels", default))
+    channels = [key for key in channels if key in DEFAULT_CHANNELS or key in default]
+    options = _import_options({**preferences, **chosen})
+    if preferences["heightMode"] == "off":
+        options["heightMode"] = "off"
+    return _effective_recipe(kind, channels, options)
+
+
+def frozen_import_recipe(kind, recipe):
+    """Validate an existing user's persisted recipe without applying current preferences."""
+    if not isinstance(recipe, dict) or any(key not in recipe for key in ("channels", "mapping", "heightMode", "modelTier")):
+        raise ValueError("导入设置无效")
+    return _effective_recipe(kind, _import_channels(recipe["channels"]), _import_options(recipe))
 
 
 def proxy_address(value):
@@ -57,6 +124,7 @@ def validate(values):
     if "proxy" in (s["apiRoute"],s["fileRoute"]) and not s["proxy"]:raise ValueError("请填写代理地址")
     if s["range"] not in {"all","quixel"} or s["tier"] not in {"professional","personal"}:raise ValueError("默认许可或范围无效")
     if not isinstance(s["background"],bool) or s["coverMiB"] not in (128,256,512,1024,2048):raise ValueError("设置值无效")
+    s["import"] = _import_preferences(s["import"])
     return s
 
 

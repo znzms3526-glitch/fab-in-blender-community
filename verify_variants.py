@@ -117,25 +117,33 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
             assert not app.jobs and not list(box.glob("*.json"))
             response = variant("upgrade", 4, True)
             assert response["state"] == "queued" and response["file"] == "wrong-label"
-            until(lambda: app.jobs.get("native", {}).get("state") in {"完成","失败"})
-            assert app.jobs["native"]["state"] == "完成", app.jobs["native"]["error"]
+            until(lambda: list(box.glob("*.json")) or app.jobs.get("native", {}).get("state") == "失败")
             assert links == ["wrong-label", "native"]
             req = take_request()
             assert req["source"]["file"] == "native" and req["source"]["k"] == 4
+            assert app.import_pending(req["queueIntent"])
             paths = storage.stage(app.cache, root/"project", req)
             imported = scene.import_files(bpy.context, paths, 0, "Verified 4K")
             materials = {obj.active_material for obj in imported if obj.type=="MESH"}
             images = {node.image for mat in materials for node in mat.node_tree.nodes if node.type=="TEX_IMAGE"}
             assert images and {tuple(image.size) for image in images} == {(4096,4096)}
+            app.finish_import_intent(req["queueIntent"], True)
+            assert app.jobs["native"]["state"] == "完成", app.jobs["native"]["error"]
             assert variant("upgrade", 4)["state"] == "cached"
 
             register("only-2k", "single", "only_4k.zip", [("cube_BaseColor.png",2048)])
             result = variant("only-2k", 4, True)
             assert result["state"] == "queued"
-            until(lambda: app.jobs["single"]["state"] in {"完成","失败"})
+            until(lambda: list(box.glob("*.json")) or app.jobs["single"]["state"] == "失败")
+            req = take_request()
+            assert req["source"]["k"] == 2 and app.import_pending(req["queueIntent"])
+            notice = next(job["notice"] for job in app.handle(dict(op="jobs")) if job["id"] == "single")
+            assert "Fab 标称 4K 的包实测尺寸不符" in notice and "2048×2048" in notice
+            paths = storage.stage(app.cache, root/"project", req)
+            fallback, = project_assets.place(bpy.context, paths, req)
+            assert {tuple(node.image.size) for node in project_assets.texture_nodes(fallback.active_material)} == {(2048,2048)}
+            app.finish_import_intent(req["queueIntent"], True)
             assert app.jobs["single"]["state"] == "完成", app.jobs["single"]["error"]
-            assert "Fab 标称 4K 的包实测尺寸不符" in app.jobs["single"]["notice"] and "2048×2048" in app.jobs["single"]["notice"]
-            assert take_request()["source"]["k"] == 2
             assert variant("only-2k", 4)["dimensions"] == [(2048,2048)]
             assert links.count("single") == 1
 
@@ -184,15 +192,17 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
             assert {tuple(n.image.size) for n in project_assets.texture_nodes(target.active_material)} == {(2048,2048)}
             assert app.enqueue(dict(uid="project", source=req["source"], k=4, fmt="FBX", action="textures",
                                     **{"import":True})) == "已加入下载队列"
-            until(lambda: app.jobs.get("scene-native", {}).get("state") in {"完成","失败"})
-            assert app.jobs["scene-native"]["state"] == "完成", app.jobs["scene-native"]["error"]
+            until(lambda: list(box.glob("*.json")) or app.jobs.get("scene-native", {}).get("state") == "失败")
             assert links[-2:] == ["scene-mislabeled","scene-native"]
             req = take_request()
             assert req["action"] == "textures" and req["source"]["file"] == "scene-native"
+            assert app.import_pending(req["queueIntent"])
             paths = storage.stage(app.cache, root/"project", req)
             assert project_assets.upgrade(target, paths, req) == 1
             image = project_assets.texture_nodes(target.active_material)[0].image
             assert tuple(image.size) == (4096,4096)
+            app.finish_import_intent(req["queueIntent"], True)
+            assert app.jobs["scene-native"]["state"] == "完成", app.jobs["scene-native"]["error"]
             pixels = paths[0].read_bytes()
             paths[0].write_bytes(b"!"*len(pixels))
             assert any(im==image and src["file"]=="scene-native" for im,src,_ in project_assets.missing_images(app.cache))

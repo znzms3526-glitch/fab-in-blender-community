@@ -95,14 +95,18 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
         with patch.object(gallery,"urlopen",lambda *a,**kw:Download(archive_bytes)),patch.object(ctl,"api",api):
             ctl.enqueue(dict(uid=src["uid"],source=src,file=src["file"],k=4,action="repair",files=[member],target=[pic.name],**{"import":True}))
             deadline=time.monotonic()+10
-            while ctl.jobs[src["file"]]["state"] in {"等待","下载中"} and time.monotonic()<deadline:time.sleep(.05)
-            assert ctl.jobs[src["file"]]["state"]=="完成",ctl.jobs[src["file"]]["error"]
+            while not list(box.glob("*.json")) and ctl.jobs[src["file"]]["state"]!="失败" and time.monotonic()<deadline:
+                time.sleep(.05)
+            assert list(box.glob("*.json")),ctl.jobs[src["file"]]["error"]
         task=next(box.glob("*.json"))
         repair=json.loads(task.read_text(encoding="utf8"))
         task.unlink()
         addon._session["scene"]=bpy.context.scene
-        addon._task=dict(paths=storage.stage(scratch,project,repair),request=repair,blend=bpy.data.filepath)
+        assert ctl.import_pending(repair["queueIntent"])
+        repair["_queue_controller"] = ctl
+        addon._task=dict(paths=project_assets.stage_request(scratch,project,repair),request=repair,blend=bpy.data.filepath)
         assert bpy.ops.fabshelf.receive()=={"FINISHED"} and path.read_bytes()==payload
+        assert ctl.jobs[src["file"]]["state"]=="完成"
         mat_req,mat_paths=request(rec,4,mode=1)
         for o in boxes[:2]:
             bpy.context.view_layer.objects.active=o

@@ -104,9 +104,9 @@ def verify_queued_destination(root):
             app.project_directory = str(new_folder)
             assert advance_request(dict(command, uid="later"))["state"] == "queued"
             release.set()
-            wait_for(lambda: all(j["state"] in {"完成", "失败"} for j in app.jobs.values()),
-                     "The downloads did not finish")
-            assert all(j["state"] == "完成" for j in app.jobs.values()), app.jobs
+            wait_for(lambda: all(j.get("receipt") or j["state"] == "失败" for j in app.jobs.values()),
+                     "The imports were not delivered")
+            assert all(j["state"] == "等待" and j.get("receipt") for j in app.jobs.values()), app.jobs
         requests = {}
         for path in box.glob("*.json"):
             request = json.loads(path.read_text(encoding="utf8"))
@@ -118,6 +118,8 @@ def verify_queued_destination(root):
             extracted, = project_assets.stage_request(app.cache, root / "project", request)
             assert extracted.is_relative_to(folder)
             assert extracted.read_bytes() == buffers[uid][2]
+            app.finish_import_intent(request["queueIntent"], True)
+        assert all(j["state"] == "完成" for j in app.jobs.values()), app.jobs
     finally:
         release.set()
         app.close()
