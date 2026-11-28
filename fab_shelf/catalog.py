@@ -13,25 +13,169 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 from urllib.request import urlopen, Request
 
-from .storage import (MODELS, IMAGES, archive_members, file_lock, file_matches, fs_path, recover_removal,
-                      removing_files, safe_member, texture_variant_key)
+from . import variants
+from .storage import (MODELS, IMAGES, archive_members, file_lock, file_matches, fs_path, member_identity,
+                      recover_removal, removing_files, safe_member, texture_variant_key)
 
 
-DIMENSION_META_VERSION = 1
+DIMENSION_META_VERSION = 2
 DIMENSION_META_LIMIT = 4 * 1024 * 1024
+
+_PACKAGING_FOLDERS = frozenset({
+    "textures", "texture", "maps", "source", "sources", "fbx", "glb",
+    "export", "exports", "original", "originals", "files", "pack", "packed",
+})
+_IMAGE_SUFFIX_RE = re.compile(r"(?:_(?:[1248]k|16k|\d{3,5}x\d{3,5}|lod\d+))+$")
+_SPECULAR_COLOR_RE = re.compile(r"(?:^|_)(?:specular|spec)_?(?:colou?r|tint)(?:_|$)|(?:^|_)tint(?:_|$)")
+_GLOSS_RE = re.compile(r"(?:^|_)(?:gloss|glossiness)(?:_|$)")
+_NORMAL_GL_RE = re.compile(r"(?:^|_)(?:normal_?map|normal|nrm|norm)_?(?:gl|opengl)(?:_|$)")
+_NORMAL_DX_RE = re.compile(r"(?:^|_)(?:normal_?map|normal|nrm|norm)_?(?:dx|directx)(?:_|$)")
+_PARSE_ROLES = (
+    ("ORM", (
+        (0, re.compile(r"(?:^|_)occlusion_?roughness_?metallic(?:_|$)")),
+        (1, re.compile(r"(?:^|_)(?:orm|arm)(?:_|$)")),
+    )),
+    ("AO", (
+        (0, re.compile(r"(?:^|_)(?:ambient_?occlusion|occlusion)(?:_|$)")),
+        (1, re.compile(r"(?:^|_)ao(?:_|$)")),
+        (2, re.compile(r"(?:^|_)o$")),
+    )),
+    ("Specular", (
+        (0, re.compile(r"(?:^|_)specular(?:_?(?:level|ior)(?:_?level)?)?(?:_|$)")),
+        (1, re.compile(r"(?:^|_)spec$")),
+    )),
+    ("Base Color", (
+        (0, re.compile(r"(?:^|_)base_?colou?r(?:_|$)")),
+        (1, re.compile(r"(?:^|_)bc(?:_|$)")),
+        (2, re.compile(r"(?:^|_)albedo(?:_|$)")),
+        (3, re.compile(r"(?:^|_)diffuse(?:_|$)")),
+        (4, re.compile(r"(?:^|_)(?:col|colou?r|diff)$")),
+    )),
+    ("Normal", (
+        (0, _NORMAL_GL_RE),
+        (1, re.compile(r"(?:^|_)(?:normal_?map|normal)(?:_|$)")),
+        (2, re.compile(r"(?:^|_)(?:norm|nrm)(?:_|$)|(?:^|_)(?:n|nor)$")),
+        (3, _NORMAL_DX_RE),
+    )),
+    ("Roughness", (
+        (0, re.compile(r"(?:^|_)roughness(?:_|$)")),
+        (1, re.compile(r"(?:^|_)(?:r|rough)$")),
+    )),
+    ("Metallic", (
+        (0, re.compile(r"(?:^|_)(?:metalness|metallic)(?:_|$)")),
+        (1, re.compile(r"(?:^|_)(?:m|metal|met)$")),
+    )),
+    ("Alpha", (
+        (0, re.compile(r"(?:^|_)(?:opacity|alpha|cutout)(?:_|$)")),
+    )),
+    ("Displacement", (
+        (0, re.compile(r"(?:^|_)displacement(?:_|$)")),
+        (1, re.compile(r"(?:^|_)disp$")),
+    )),
+    ("Height", (
+        (0, re.compile(r"(?:^|_)height(?:_|$)")),
+        (1, re.compile(r"(?:^|_)h$")),
+    )),
+    ("Bump", (
+        (0, re.compile(r"(?:^|_)bump(?:_|$)")),
+        (1, re.compile(r"(?:^|_)bmp$")),
+    )),
+)
+
+
+def parse_texture(path):
+    """Pure parser returning set_key, role, alias_rank, normal_direction, lod, size_hint, ext, zip_depth."""
+    _, zip_chain, raw_path = member_identity("", str(path))
+    inner = PurePosixPath(raw_path.replace("\\", "/"))
+    ext = inner.suffix.lower()
+    raw_key = re.sub(r"[^a-z0-9]+", "_", inner.stem.casefold()).strip("_")
+    parent_parts = [
+        p for p in inner.parent.parts
+        if p not in ("/", "\\") and not re.fullmatch(r"[a-zA-Z]:[/\\]?", p)
+    ]
+    if not zip_chain and parent_parts:
+        digest_indices = [idx for idx, part in enumerate(parent_parts) if re.fullmatch(r"[a-f0-9]{64}", part, re.I)]
+        if digest_indices:
+            parent_parts = parent_parts[digest_indices[-1] + 1:]
+        else:
+            for idx in range(len(parent_parts) - 2):
+                if (parent_parts[idx].casefold() == "assets"
+                        and parent_parts[idx + 1].casefold() == "fab"
+                        and re.fullmatch(r"[a-f0-9]{16,64}", parent_parts[idx + 2], re.I)):
+                    if len(parent_parts[idx + 2]) == 16 and idx + 3 == len(parent_parts):
+                        raw_key = re.sub(r"^[a-f0-9]{8}_", "", raw_key)
+                    parent_parts = parent_parts[idx + 3:]
+                    break
+    key = _IMAGE_SUFFIX_RE.sub("", raw_key)
+    lod = variants.filename_lod(inner)
+    size_hint = variants.explicit_size(inner, check_parents=True)
+
+    role = None
+    alias_rank = 99
+    normal_direction = None
+    matched_span = None
+    if not _SPECULAR_COLOR_RE.search(key) and not _GLOSS_RE.search(key):
+        for channel, matchers in _PARSE_ROLES:
+            for rank_value, pattern in matchers:
+                match = pattern.search(key)
+                if match:
+                    role = channel
+                    alias_rank = rank_value
+                    matched_span = match.span()
+                    if channel == "Normal":
+                        if _NORMAL_GL_RE.search(key):
+                            normal_direction = "GL"
+                            alias_rank = 0
+                        elif _NORMAL_DX_RE.search(key):
+                            normal_direction = "DX"
+                            alias_rank = 3
+                    break
+            if role is not None:
+                break
+
+    set_key_str = key
+    if matched_span is not None:
+        set_key_str = key[:matched_span[0]] + "_" + key[matched_span[1]:]
+    tokens = tuple(
+        token
+        for token in set_key_str.split("_")
+        if token
+        and not re.fullmatch(r"[1248]k|16k|\d{3,5}x\d{3,5}|lod\d+|dx|gl|directx|opengl", token)
+    )
+    folders = tuple(
+        folder.casefold()
+        for folder in parent_parts
+        if not re.fullmatch(r"[1248]k|16k|(?:1024|2048|4096|8192|16384)x(?:1024|2048|4096|8192|16384)|lod\d+", folder.casefold())
+        and folder.casefold() not in _PACKAGING_FOLDERS
+        and not folder.lower().endswith(".zip")
+    )
+    return dict(
+        set_key=(folders, tokens),
+        role=role,
+        alias_rank=alias_rank,
+        normal_direction=normal_direction,
+        lod=lod,
+        size_hint=size_hint,
+        ext=ext,
+        zip_depth=len(zip_chain),
+        zip_chain=zip_chain,
+        raw_path=raw_path,
+    )
 
 
 def size(name):
-    match = re.search(r"(?<![a-z0-9])([1248]|16)k(?![a-z0-9])", name, re.I)
-    return int(match[1]) if match else 0
+    return variants.explicit_size(name) or 0
 
 
 def quality(name):
+    explicit = variants.explicit_size(name)
+    if explicit:
+        return explicit
     n = name.lower()
     for level, pattern in [(8, r"raw|cinematic|nanite"), (4, r"high"), (2, r"medium|mid"), (1, r"low")]:
-        if re.search(r"(?:^|[^a-z])(?:"+pattern+r")(?:[^a-z]|$)", n):
+        if re.search(r"(?:^|[^a-z])(?:" + pattern + r")(?:[^a-z]|$)", n):
             return level
-    return size(name)
+    return 0
 
 
 def pick_format(files, tier, kind):
@@ -153,7 +297,9 @@ def texture_dimensions(blob, name):
     try:
         with blob.open("rb") as stream:
             if zipfile.is_zipfile(stream):
-                with zipfile.ZipFile(stream) as archive, archive_members(archive) as members:
+                with zipfile.ZipFile(stream) as archive, archive_members(
+                    archive, package_hash=Path(blob).name, dedup=True
+                ) as members:
                     for member, (container, item) in members.items():
                         suffix = Path(member).suffix.lower()
                         if suffix == ".glb":
@@ -162,8 +308,7 @@ def texture_dimensions(blob, name):
                         elif suffix in IMAGES:
                             with container.open(item) as image:
                                 size_px = image_dimensions(image, suffix)
-                            if size_px and min(size_px) > 0:
-                                sizes[member] = size_px
+                            sizes[member] = size_px if (size_px and min(size_px) > 0) else None
                 return sizes
             stream.seek(0)
             suffix = Path(name).suffix.lower()
@@ -171,8 +316,7 @@ def texture_dimensions(blob, name):
                 sizes.update(glb_dimensions(stream, name))
             elif suffix in IMAGES:
                 size_px = image_dimensions(stream, suffix)
-                if size_px and min(size_px) > 0:
-                    sizes[name] = size_px
+                sizes[name] = size_px if (size_px and min(size_px) > 0) else None
     except OSError:
         return None
     except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, zipfile.BadZipFile, EOFError):
@@ -258,7 +402,9 @@ _FBX_METADATA_LIMIT = 256 * 1024 * 1024
 def member_sizes(blob, name):
     try:
         if zipfile.is_zipfile(blob):
-            with zipfile.ZipFile(blob) as archive, archive_members(archive) as members:
+            with zipfile.ZipFile(blob) as archive, archive_members(
+                archive, package_hash=Path(blob).name, dedup=True
+            ) as members:
                 return {member: info.file_size for member, (_, info) in members.items()}
         if Path(blob).is_file():
             return {name: Path(blob).stat().st_size}
@@ -298,12 +444,7 @@ def _primary_model(models, title, sizes):
 
 
 def geometry_lod(name):
-    path = PurePosixPath(str(name).replace("\\", "/"))
-    for token in (path.stem, *reversed(path.parent.parts)):
-        match = LOD_RE.search(token)
-        if match:
-            return int(match[1])
-    return None
+    return variants.filename_lod(name)
 
 
 def _member_tokens(value):
@@ -351,7 +492,8 @@ def model_tier_members(models, *, title="", sizes=None):
     if levels and unlabeled:
         levels.setdefault(0, unlabeled[0])
     if len(levels) < 2:
-        return dict.fromkeys(("high", "medium", "low"), anchor)
+        tier = variants.mesh_hint(anchor, member=True)
+        return {tier: anchor} if tier in variants.TIERS else {}
     ranked = sorted(levels)
     middle = ranked[len(ranked) // 2]
     if len(ranked) >= 3:
@@ -361,7 +503,11 @@ def model_tier_members(models, *, title="", sizes=None):
 
 
 def pick_primary_model(models, *, title="", sizes=None, model_tier="high"):
-    return model_tier_members(models, title=title, sizes=sizes).get(model_tier)
+    tiers = model_tier_members(models, title=title, sizes=sizes)
+    if tiers.get(model_tier):
+        return tiers[model_tier]
+    family = model_family_members(models, title=title, sizes=sizes)
+    return _primary_model(family or models, title, sizes)
 
 
 def _fbx_image_references(stream, limit):
@@ -499,6 +645,12 @@ def glb_original_files(blob, package_name, model_member, names):
 class AmbiguousTextureSelection(ValueError):
     """The package offers multiple plausible files and needs a manual selection."""
 
+    def __init__(self, message, *, slot=None, channel=None, candidates=()):
+        super().__init__(message)
+        self.slot = slot
+        self.channel = channel
+        self.candidates = list(candidates)
+
 
 def enabled_texture_roles(channels, height_mode):
     roles = set(channels) - {"Height"}
@@ -513,23 +665,43 @@ def enabled_texture_roles(channels, height_mode):
 
 
 def filter_texture_files(names, role, *, channels, height_mode):
-    allowed = enabled_texture_roles(channels, height_mode)
-    images = {name: role(Path(name)) for name in names if Path(name).suffix.lower() in IMAGES}
-    present = set(images.values()) & allowed
+    base_allowed = enabled_texture_roles(channels, height_mode)
+    images = []
+    for name in names:
+        if Path(name).suffix.lower() not in IMAGES:
+            continue
+        parsed = parse_texture(name)
+        r = role(Path(name)) if role is not None else parsed["role"]
+        if r in base_allowed:
+            images.append((name, r, parsed["set_key"]))
+    by_set = {}
+    for name, r, set_key in images:
+        by_set.setdefault(set_key, []).append((name, r))
+    kept = []
     height_order = ("Displacement", "Height") if height_mode == "displacement" else _HEIGHT_ROLES
-    height_role = next((key for key in height_order if key in present), None)
-    if not any(key in channels and key not in present for key in _ORM_ROLES):
-        allowed.discard("ORM")
-    allowed.difference_update(key for key in _HEIGHT_ROLES if key != height_role)
-    return [name for name, key in images.items() if key in allowed]
+    for set_key, items in by_set.items():
+        allowed = set(base_allowed)
+        present = {r for _, r in items} & allowed
+        height_role = next((key for key in height_order if key in present), None)
+        if not any(key in channels and key not in present for key in _ORM_ROLES):
+            allowed.discard("ORM")
+        allowed.difference_update(key for key in _HEIGHT_ROLES if key != height_role)
+        kept.extend(name for name, r in items if r in allowed)
+    return kept
 
 
 def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", sizes=None,
                   model_tier="high", channels=None, height_mode="off", texture_set=None):
-    goal = {"LIGHT":1,"STANDARD":2,"HIGH":4}.get(tier, tier)
+    goal = {"LIGHT": 1, "STANDARD": 2, "HIGH": 4}.get(tier, tier)
     models = sorted(n for n in names if Path(n).suffix.lower() in MODELS)
-    model = chosen if chosen in models else pick_primary_model(models, title=title, sizes=sizes, model_tier=model_tier)
+    if chosen is not None:
+        if chosen not in models:
+            raise ValueError("请选择可用的包内文件")
+        model = chosen
+    else:
+        model = pick_primary_model(models, title=title, sizes=sizes, model_tier=model_tier)
     selected = [model] if model else []
+
     def stem_tokens(path):
         return {token for token in re.findall(r"[a-z0-9]+", path.stem.lower())
                 if not re.fullmatch(r"\d+k|lod\d+|low|mid|medium|high|raw", token)}
@@ -540,6 +712,7 @@ def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", 
     model_paths = [member_path(name) for name in models]
     families = {path: stem_tokens(path) for path in model_paths}
     selected_model = member_path(model) if model else None
+
     def model_family(path):
         parts = tuple(tokens for part in path.parent.parts if part not in MODEL_VARIANTS
                       and (tokens := _member_tokens(part)))
@@ -580,29 +753,54 @@ def default_files(names, tier, role, chosen=None, dimensions=None, *, title="", 
         if texture_lod is not None and selected_lod is not None and texture_lod != selected_lod:
             continue
         candidates.append(n)
+
     groups = {}
-    for n in filter_texture_files(candidates, role, channels=_DEFAULT_ROLES if channels is None else channels,
-                                  height_mode=height_mode):
-        key = role(Path(n))
-        if selected_model and channels is None:
-            # Separate material maps can have the same PBR role. Keep one size per map.
-            key = key, texture_variant_key(member_path(n))
-        groups.setdefault(key, []).append(n)
-    def rank(n):
+    for n in filter_texture_files(
+        candidates,
+        role,
+        channels=_DEFAULT_ROLES if channels is None else channels,
+        height_mode=height_mode,
+    ):
+        parsed = parse_texture(n)
+        channel = role(Path(n)) if role is not None else parsed["role"]
+        set_key = texture_set(member_path(n)) if texture_set is not None else parsed["set_key"]
+        groups.setdefault((set_key, channel), []).append((n, parsed))
+
+    if not model and len({sk for sk, _ in groups}) > 1 and (texture_set is not None or channels is not None):
+        all_candidates = sorted({n for grp in groups.values() for n, _ in grp})
+        raise AmbiguousTextureSelection(
+            "包内贴图来自不同材质套，请在详情中手动选择",
+            candidates=all_candidates,
+        )
+
+    def rank_priority(item):
+        n, parsed = item
+        channel = parsed["role"]
         pixels = (dimensions or {}).get(n)
-        level = max(pixels) / 1024 if pixels else size(n)
+        level = max(pixels) / 1024 if pixels else parsed["size_hint"]
+        size_dist = abs(level - goal) if level else float("inf")
+        lod = parsed["lod"]
+        lod_rank = 0 if selected_lod is not None and lod == selected_lod else 1 if lod is None else 2
+        is_height = channel in _HEIGHT_ROLES
+        ext_order = (".exr", ".png", ".tif", ".tiff", ".tga", ".jpg", ".jpeg") if is_height else (
+            ".png", ".tga", ".tif", ".tiff", ".exr", ".jpg", ".jpeg"
+        )
+        ext_rank = ext_order.index(parsed["ext"]) if parsed["ext"] in ext_order else len(ext_order)
         overlap = len(families[selected_model] & stem_tokens(member_path(n))) if selected_model else 0
-        lod = geometry_lod(n)
-        return (abs(level-goal) if level else float("inf"),
-                0 if selected_lod is not None and lod == selected_lod else 1 if lod is None else 2, -overlap, n)
-    for key, group in groups.items():
-        channel = key[0] if isinstance(key, tuple) else key
-        ordered = sorted(group, key=rank)
-        if channels is not None and len(ordered) > 1 and rank(ordered[0])[:-1] == rank(ordered[1])[:-1]:
-            raise AmbiguousTextureSelection("同一通道存在多个同档贴图，请在详情中手动选择：" + channel)
-        selected.append(ordered[0])
-    if texture_set is not None and not model and len({texture_set(member_path(name)) for name in selected}) > 1:
-        raise AmbiguousTextureSelection("包内贴图来自不同材质套，请在详情中手动选择")
+        return (lod_rank, size_dist, parsed["alias_rank"], parsed["zip_depth"], ext_rank, -overlap)
+
+    for (set_key, channel), group in groups.items():
+        ordered = sorted(group, key=lambda item: (*rank_priority(item), item[0].casefold(), item[0]))
+        if channels is not None and len(ordered) > 1 and rank_priority(ordered[0]) == rank_priority(ordered[1]):
+            top_prio = rank_priority(ordered[0])
+            tied = [n for n, parsed in ordered if rank_priority((n, parsed)) == top_prio]
+            raise AmbiguousTextureSelection(
+                "同一通道存在多个同档贴图，请在详情中手动选择：" + channel,
+                channel=channel,
+                candidates=tied,
+            )
+        selected.append(ordered[0][0])
+
     if not selected and channels is None and len(names) == 1 and role(Path(names[0])) is None:
         selected = list(names)
     return selected
@@ -615,7 +813,9 @@ def local_files(cache, rec):
 
 def package_members(blob,name):
     if zipfile.is_zipfile(blob):
-        with zipfile.ZipFile(blob) as z, archive_members(z) as members:
+        with zipfile.ZipFile(blob) as z, archive_members(
+            z, package_hash=Path(blob).name, dedup=True
+        ) as members:
             return list(members)
     return [name] if Path(name).suffix.lower() in MODELS | IMAGES else []
 

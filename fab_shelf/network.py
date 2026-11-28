@@ -24,6 +24,7 @@ from urllib.request import (HTTPHandler, HTTPRedirectHandler, HTTPSHandler, Prox
 DEFAULT_CHANNELS = ("Base Color", "Normal", "Roughness", "Metallic", "Alpha")
 IMPORT_CHANNELS = (*DEFAULT_CHANNELS, "AO", "Specular", "Height")
 MODEL_TIERS = ("low", "medium", "high")
+RECIPE_TIERS = (*MODEL_TIERS, "raw")
 HEIGHT_MODES = ("off", "bump", "displacement")
 DEFAULT_IMPORT = dict(channels=DEFAULT_CHANNELS, mapping=True, heightMode="off", modelTier="high")
 DEFAULTS=dict(language="zh-CN",apiRoute="system",fileRoute="system",proxy="",range="quixel",tier="personal",
@@ -40,9 +41,10 @@ def _import_channels(value):
     return [channel for channel in IMPORT_CHANNELS if channel in value]
 
 
-def _import_options(values):
+def _import_options(values, *, allow_raw=False):
+    tiers = RECIPE_TIERS if allow_raw else MODEL_TIERS
     if (type(values["mapping"]) is not bool or values["heightMode"] not in HEIGHT_MODES
-            or values["modelTier"] not in MODEL_TIERS):
+            or values["modelTier"] not in tiers):
         raise ValueError("导入设置无效")
     return {key: values[key] for key in ("mapping", "heightMode", "modelTier")}
 
@@ -83,7 +85,7 @@ def import_recipe(settings, kind, override=None):
     chosen = override or {}
     channels = _import_channels(chosen.get("channels", default))
     channels = [key for key in channels if key in DEFAULT_CHANNELS or key in default]
-    options = _import_options({**preferences, **chosen})
+    options = _import_options({**preferences, **chosen}, allow_raw=True)
     if preferences["heightMode"] == "off":
         options["heightMode"] = "off"
     return _effective_recipe(kind, channels, options)
@@ -93,7 +95,7 @@ def frozen_import_recipe(kind, recipe):
     """Validate an existing user's persisted recipe without applying current preferences."""
     if not isinstance(recipe, dict) or any(key not in recipe for key in ("channels", "mapping", "heightMode", "modelTier")):
         raise ValueError("导入设置无效")
-    return _effective_recipe(kind, _import_channels(recipe["channels"]), _import_options(recipe))
+    return _effective_recipe(kind, _import_channels(recipe["channels"]), _import_options(recipe, allow_raw=True))
 
 
 def proxy_address(value):

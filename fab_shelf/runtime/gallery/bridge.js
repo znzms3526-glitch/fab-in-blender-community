@@ -236,7 +236,7 @@ function initBridgeLibrary() {
 }
 
 function bridgeSizeLabel(pixels) {
-  if (!pixels) return tr("原始文件") + " · " + tr("贴图尺寸待确认");
+  if (!pixels) return tr("原始文件");
   const [width, height] = pixels;
   const label = width === height && width % 1024 === 0 ? width / 1024 + "K · " : "";
   return label + width + "×" + height;

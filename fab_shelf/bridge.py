@@ -13,7 +13,7 @@ import uuid
 
 from . import catalog, storage
 from .desktop import lock_file
-from .scene import role
+from .scene import role, texture_set_key
 
 
 INDEX_NAME = "bridge-library.json"
@@ -499,9 +499,17 @@ class BridgeLibrary:
         if suffix == ".glb":
             selected = [model]
         else:
-            selected = catalog.default_files([*models, *textures], max(pixels) // 1024 if pixels else 2, role,
-                                             chosen=model, dimensions=dims, title=record["title"],
-                                             channels=recipe["channels"], height_mode=recipe["heightMode"])
+            selected = catalog.default_files(
+                [*models, *textures],
+                max(pixels) // 1024 if pixels else 2,
+                role,
+                chosen=model,
+                dimensions=dims,
+                title=record["title"],
+                channels=recipe["channels"],
+                height_mode=recipe["heightMode"],
+                texture_set=None if model else texture_set_key,
+            )
         if not selected:
             raise ValueError("所选规格没有可用的已启用贴图通道")
         all_members = list(dict.fromkeys([*selected, *original]))

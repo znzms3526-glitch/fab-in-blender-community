@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp:
         task=next(box.glob("*.json"))
         repair=json.loads(task.read_text(encoding="utf8"))
         task.unlink()
-        addon._session["scene"]=bpy.context.scene
+        addon._session.update(window=bpy.context.window, scene_uid=bpy.context.scene.session_uid)
         assert ctl.import_pending(repair["queueIntent"])
         repair["_queue_controller"] = ctl
         addon._task=dict(paths=project_assets.stage_request(scratch,project,repair),request=repair,blend=bpy.data.filepath)

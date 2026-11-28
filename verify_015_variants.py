@@ -114,7 +114,7 @@ def exercise(app):
         mismatch=choose("Rock")
         assert mismatch["state"]=="confirm" and {row["format"] for row in mismatch["choices"]}=={"FBX","GLB"}
         compatible=choose("Rock",preset)
-        assert compatible["state"]=="cached" and compatible["format"]=="FBX"
+        assert compatible["state"]=="queued" and compatible["file"]=="rock-4k"
         assert choose("Board")["file"]=="native-fbx"
         assert queued[-1][1]["selection"]==target
         assert choose("Board",dict(target,mode="locked",fileId="converted"))["file"]=="converted"
@@ -165,12 +165,14 @@ def exercise(app):
         assert {key for key,_ in queued[queue_index:]}=={"low-2k","rug"}
         assert next(plan for key,plan in queued[queue_index:] if key=="low-2k")["selection"]["fileId"]=="low-2k"
 
-        # An advertised 4K transfer can resolve to 2K. Report it for confirmation before applying.
+        # An advertised 4K transfer that resolves to 2K imports with a clear nominal-vs-actual notice instead of re-confirming.
         asset("Wrong")
         previous=register(app,"Wrong","claimed-4k","fbx",{"Wrong.fbx":b"fbx","Wrong_BaseColor.png":png_header(2048)})
-        retry=choose("Wrong",_selectedTransfer=previous["file"],**{"import":True})
-        assert retry["state"]=="confirm" and retry["choices"][0]["dimensions"]==[(2048,2048)]
-        assert not list(app.box.glob("*.json"))
+        retry=choose("Wrong",dict(target,mode="locked",localHash=previous["hash"]),_selectedTransfer=previous["file"],**{"import":True})
+        assert retry["state"]=="cached" and retry["dimensions"]==[(2048,2048)]
+        assert "标称 4K" in retry["notice"] and "2048×2048" in retry["notice"]
+        request_path,=app.box.glob("*.json")
+        request_path.unlink()
         retry=choose("Wrong",preset,_selectedTransfer=previous["file"],**{"import":True})
         assert retry["state"]=="cached" and retry["dimensions"]==[(2048,2048)]
         request_path,=app.box.glob("*.json")
@@ -221,9 +223,8 @@ def exercise(app):
         assert request["queueIntent"]["job"]=="opaque-second"
         assert checks==["OpaqueProbe"] and downloads==["opaque-first","opaque-second"]
         assert app.jobs["opaque-first"]["state"]=="完成" and "opaque-third" not in app.jobs
-        remaining=app.jobs["opaque-second"]["task"]["request"]["files"]
-        assert [file["uid"] for file in remaining]==["opaque-second","opaque-third"]
         app.finish_import_intent(request["queueIntent"],True)
+        assert app.jobs["opaque-second"]["state"]=="完成"
         request_path.unlink()
     print("FAB_015_AUTO_VARIANTS_PASS")
 

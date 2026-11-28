@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Fab in Blender · Fab 资产库",
     "author": "Fab Shelf",
-    "version": (0, 15, 0),
+    "version": (0, 15, 2),
     "blender": (4, 1, 1),
     "location": "3D 视图 > N 面板 > Fab",
     "description": "在副屏浏览 Fab，下载资产并导入工程或 Blender 资产库",
@@ -9,6 +9,9 @@ bl_info = {
 }
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from array import array
+from collections import OrderedDict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +21,7 @@ from .desktop import host_command
 import tempfile
 import threading
 import time
+import uuid
 
 import bpy
 from bpy.app.handlers import persistent
@@ -103,17 +107,28 @@ def release_window():
     return closed
 
 
+def gallery_target_label():
+    scene_uid = _session["scene_uid"]
+    scene = next((item for item in bpy.data.scenes if item.session_uid == scene_uid), None)
+    return (Path(bpy.data.filepath).name or "未保存工程") + " › " + (scene.name if scene else "原场景已移除")
+
+
 def show_gallery():
-    runtime=Path(__file__).parent/"runtime"
-    target=(Path(bpy.data.filepath).name or "未保存工程")+" › "+_session["scene"].name
+    target=gallery_target_label()
     _session["proc"]=subprocess.Popen(host_command("gallery",_session["box"].name,str(os.getpid()),str(_session["cache"]),target))
 
 
-def start_gallery(cache, scope, window, scene_at_start, *, settings=None, switching_from=None):
+def start_gallery(cache, scope, window, scene_uid, *, settings=None, switching_from=None):
     box = tempfile.TemporaryDirectory(prefix="FabShelf-")
-    _session.update(cache=cache, box=box, window=window, scene=scene_at_start)
+    _session.update(cache=cache, box=box, window=window, scene_uid=scene_uid)
+    sync_document()
+    adopt_closed_queues(cache)
     _session["gallery"] = gallery.Gallery(cache, Path(box.name), scope, manage_auth=True,
-                                         settings=settings, switching_from=switching_from)
+                                         settings=settings, switching_from=switching_from,
+                                         targets=ImportTargets(window, scene_uid))
+    _session["gallery"].targets.watch_selection()
+    if not bpy.data.filepath:
+        _session.setdefault("unsaved_journals", set()).add(_session["gallery"].journal)
     show_gallery()
     sync_project_state()
 
@@ -149,7 +164,7 @@ def begin_cache_switch(controller, change):
     process = _session.get("proc")
     switch = dict(source=controller.cache, target=target, settings=settings,
                   previous_settings=controller.settings, scope=controller.project_scope,
-                  window=_session["window"], scene=_session["scene"],
+                  window=_session["window"], scene_uid=_session["scene_uid"],
                   reopen=process is not None and process.poll() is None)
     _session["cache_switch"] = switch
     _session.pop("cache_pending", None)
@@ -190,7 +205,7 @@ def advance_cache_switch(context):
             message = f"无法切换 Fab 下载库 · {switch['target']} · {switch['error']}"
             if switch["reopen"]:
                 try:
-                    start_gallery(switch["source"], switch["scope"], switch["window"], switch["scene"],
+                    start_gallery(switch["source"], switch["scope"], switch["window"], switch["scene_uid"],
                                   settings=switch["previous_settings"])
                 except Exception as exc:
                     release_window()
@@ -199,7 +214,7 @@ def advance_cache_switch(context):
             return
         try:
             if switch["reopen"]:
-                start_gallery(switch["target"], switch["scope"], switch["window"], switch["scene"],
+                start_gallery(switch["target"], switch["scope"], switch["window"], switch["scene_uid"],
                               settings=switch["settings"], switching_from=switch["source"])
                 switch["deadline"] = time.monotonic() + 15
         except Exception as exc:
@@ -273,10 +288,46 @@ def resume_saved(*args):
     if _session.get("held") and not bpy.app.timers.is_registered(tick):
         bpy.app.timers.register(tick,first_interval=0.1)
 
+def adopt_closed_queues(cache=None):
+    pending = _session.get("queue_adoptions", {})
+    for journal, project in list(pending.items()):
+        if cache is not None and journal.parent.parent != cache:
+            continue
+        try:
+            if any(path.suffix == ".json" for path in journal.iterdir()):
+                gallery.adopt_queue(journal, project)
+        except OSError:
+            continue
+        del pending[journal]
+
+
+def sync_document():
+    path = os.path.normcase(bpy.data.filepath)
+    previous = _session.get("document_path")
+    controller = _session.get("gallery")
+    if previous != path:
+        if previous != "":
+            _session["document"] = uuid.uuid4().hex
+        if previous == "":
+            pending = _session.setdefault("queue_adoptions", {})
+            for journal in _session.pop("unsaved_journals", ()):
+                if not controller or journal != controller.journal:
+                    pending[journal] = bpy.data.filepath
+            adopt_closed_queues()
+        if switch := _session.get("cache_switch"):
+            switch["scope"] = bpy.data.filepath or switch["scope"]
+        _session["document_path"] = path
+    if controller and path and controller.project_scope and os.path.normcase(controller.project_scope) != path:
+        controller.use_project(bpy.data.filepath, first_save=controller.project_scope == "unsaved-" + _session["document"],
+                               document=_session["document"])
+
 
 def sync_project_state():
+    sync_document()
     controller=_session.get("gallery")
     if not controller:return
+    if controller.targets:
+        controller.targets.update()
     controller.project_directory=project_assets.configured_directory()
     saved=bool(bpy.data.filepath)
     state=dict(saved=saved,waiting=0 if saved else len(_session.get("held",[])))
@@ -299,7 +350,7 @@ def after_runtime(context, action):
         _session.pop("runtime_error", None)
         note("正在安装 Microsoft WebView2，完成后将自动打开 Fab 资产库…")
         bpy.app.timers.register(finish_runtime_setup, first_interval=.4)
-    entry=(context.window, context.scene, action)
+    entry=(context.window, context.scene.session_uid, action)
     if entry not in setup["actions"]:
         setup["actions"].append(entry)
 
@@ -315,9 +366,9 @@ def finish_runtime_setup():
         _session["runtime_error"]=True
         note(e)
         return None
-    for window,scene_at_start,action in setup["actions"]:
+    for window,scene_uid,action in setup["actions"]:
         try:
-            if window in list(bpy.context.window_manager.windows) and window.scene==scene_at_start:
+            if window_matches_scene(window, scene_uid):
                 with bpy.context.temp_override(window=window):
                     action(bpy.context)
         except (ValueError,OSError,RuntimeError,ReferenceError) as e:
@@ -357,8 +408,10 @@ def open_gallery(context):
             raise ValueError("请选择绝对路径作为共享下载库")
         cache = Path(value).resolve()
         cache.mkdir(parents=True, exist_ok=True)
-        scope=bpy.data.filepath or ("unsaved-"+str(os.getpid())+"-"+str(context.scene.as_pointer()))
-        start_gallery(cache, scope, context.window, context.scene)
+        scene_uid = context.scene.session_uid
+        sync_document()
+        scope=bpy.data.filepath or ("unsaved-"+_session["document"])
+        start_gallery(cache, scope, context.window, scene_uid)
         if not _pool:_pool=ThreadPoolExecutor(max_workers=1)
         if not bpy.app.timers.is_registered(tick):
             bpy.app.timers.register(tick, first_interval=0.4)
@@ -368,9 +421,21 @@ def open_gallery(context):
         raise
 
 
-def viewport():
-    win = _session["window"]
-    if win not in list(bpy.context.window_manager.windows) or win.scene != _session["scene"]:
+def window_matches_scene(window, scene_uid):
+    return (window is not None and window in list(bpy.context.window_manager.windows)
+            and window.scene.session_uid == scene_uid)
+
+
+def viewport(binding=None):
+    if binding:
+        if (binding["document"] != _session.get("document")
+                or os.path.normcase(bpy.data.filepath) != _session.get("document_path")):
+            raise ValueError("工程或场景发生改变，请从资产库重新发送")
+        win = _session.get("target_windows", {}).get(binding["window"])
+        scene_uid = binding["scene"]
+    else:
+        win, scene_uid = _session["window"], _session["scene_uid"]
+    if not window_matches_scene(win, scene_uid):
         raise ValueError("目标窗口或场景已改变，请切回原场景")
     area = next((a for a in win.screen.areas if a.type=="VIEW_3D"), None)
     if area is None:
@@ -385,7 +450,7 @@ def finish_receive(request, success, error=""):
     if not controller or not receipt:
         return
     try:
-        controller.finish_import_intent(receipt, success, error)
+        controller.finish_import_intent(receipt, success, error, notice=request.get("_applied_notice", ""))
     except OSError as issue:
         note(issue)
 
@@ -408,7 +473,13 @@ class FAB_OT_import(bpy.types.Operator):
         if not receive_pending(request):
             _task = None
             return {"CANCELLED"}
-        if context.scene != _session["scene"] or bpy.data.filepath != _task["blend"]:
+        binding = request.get("importTarget")
+        try:
+            target_window = viewport(binding)["window"]
+        except ValueError:
+            target_window = None
+        if (target_window is None or context.window != target_window or context.scene != context.window.scene
+                or bpy.data.filepath != _task["blend"]):
             message = "工程或场景发生改变，请从资产库重新发送"
             self.report({"ERROR"}, message)
             _task = None
@@ -432,10 +503,14 @@ class FAB_OT_import(bpy.types.Operator):
             if not objs and context.active_object:
                 material=context.active_object.active_material
             _session["import_directory"]=imported_directory(material,_task["paths"])
-            if objs:
-                note("已导入活动集合 · "+context.view_layer.active_layer_collection.collection.name)
-            else:
-                note("材质已导入 · "+request["name"])
+            summary = request.get("_import_summary") or {}
+            message = ("已导入活动集合 · " + context.view_layer.active_layer_collection.collection.name
+                       if objs else "材质已导入 · " + request["name"])
+            if specification := request.get("actualSpecNotice"):
+                request["_applied_notice"] = specification + "，已导入"
+            elif summary.get("fallback"):
+                request["_applied_notice"] = "无可用贴图，已用安全材质"
+            note(message + (" · " + request["_applied_notice"] if "_applied_notice" in request else ""))
             success = True
         except Exception as e:
             error = str(e)
@@ -453,13 +528,101 @@ class FAB_OT_import(bpy.types.Operator):
         return {"FINISHED"}
 
 
-def target_state(ctx):
-    obj = ctx.active_object
-    faces = ()
-    if obj and obj.type=="MESH" and obj.mode=="EDIT":
+def selection_state(obj, *, precise=True):
+    faces = ""
+    if obj and obj.type=="MESH" and obj.mode=="EDIT" and precise:
         import bmesh
-        faces = tuple(f.index for f in bmesh.from_edit_mesh(obj.data).faces if f.select)
-    return (obj.as_pointer() if obj else 0, obj.active_material_index if obj else 0, ctx.mode, faces)
+        mesh_faces = bmesh.from_edit_mesh(obj.data).faces
+        mesh_faces.index_update()
+        indices = array("i", (f.index for f in mesh_faces if f.select))
+        faces = hashlib.blake2s(indices, digest_size=16).hexdigest()
+    return [obj.session_uid if obj else 0, obj.active_material_index if obj else 0,
+            obj.mode if obj else "OBJECT", obj.data.session_uid if obj and obj.data else 0,
+            obj.active_material.session_uid if obj and obj.active_material else 0, faces]
+
+
+def target_state(ctx, *, material=False):
+    state = selection_state(ctx.active_object)
+    return state if material else state[:3] + state[-1:]
+
+
+class ImportTargets:
+    """Freeze the bound Blender target before a gallery worker starts resolving files."""
+    def __init__(self, window, scene_uid):
+        self.window = window
+        windows = _session.setdefault("target_windows", {})
+        live = list(bpy.context.window_manager.windows)
+        for key in list(windows):
+            if windows[key] not in live:
+                del windows[key]
+        self.window_id = next((key for key, value in windows.items() if value == window), None)
+        if self.window_id is None:
+            self.window_id = uuid.uuid4().hex
+            windows[self.window_id] = window
+        self.scene_uid = scene_uid
+        self.lock = threading.Lock()
+        self.closed = False
+        self.serial = 0
+        self.pending = None
+        self.checked = OrderedDict()
+        self.latest = self.snapshot(precise=True)
+
+    def snapshot(self, *, precise):
+        state = None
+        if window_matches_scene(self.window, self.scene_uid):
+            state = selection_state(self.window.view_layer.objects.active, precise=precise)
+        return dict(document=_session["document"], window=self.window_id, scene=self.scene_uid, selection=state)
+
+    def watch_selection(self):
+        for key in ((bpy.types.LayerObjects, "active"), (bpy.types.Object, "active_material_index"),
+                    (bpy.types.MaterialSlot, "material"), (bpy.types.Window, "scene")):
+            bpy.msgbus.subscribe_rna(key=key, owner=self, args=(self,), notify=ImportTargets.update)
+
+    def capture(self, *, selection):
+        if threading.current_thread() is threading.main_thread():
+            return self.snapshot(precise=selection)
+        with self.lock:
+            if self.closed:
+                raise ValueError("窗口已关闭")
+            if not selection:
+                return self.latest
+            if self.pending is None:
+                self.serial += 1
+                self.pending = (self.serial, self.latest)
+            return dict(self.latest, sample=self.pending[0])
+
+    def update(self):
+        # Metadata, downloads and UI replies never wait for Blender's event loop.
+        # Compare the submission snapshot with the first main-thread observation.
+        current = self.snapshot(precise=False)
+        with self.lock:
+            pending, self.pending = self.pending, None
+            state, old = current["selection"], self.latest["selection"]
+            if state and state[2] == "EDIT":
+                if pending or not old or state[:-1] != old[:-1]:
+                    current = self.snapshot(precise=True)
+                else:
+                    current["selection"] = old
+            if pending:
+                serial, before = pending
+                self.checked[serial] = current["selection"] if before == current else None
+                if len(self.checked) > 256:
+                    self.checked.popitem(last=False)
+            self.latest = current
+
+    def resolve(self, binding):
+        if "sample" not in binding:
+            return binding
+        self.update()
+        resolved = dict(binding)
+        # An expired or ambiguous observation always requires explicit confirmation.
+        resolved["selection"] = self.checked.get(resolved.pop("sample"))
+        return resolved
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+        bpy.msgbus.clear_by_owner(self)
 
 
 def tick():
@@ -479,6 +642,8 @@ def tick():
             change = None if switching or stage_busy else controller.take_idle_cache_change()
             for f in sorted(Path(box.name).glob("*.json"),key=lambda p:p.stat().st_mtime_ns):
                 request = json.loads(f.read_text(encoding="utf-8-sig"))
+                if binding := request.get("importTarget"):
+                    request["importTarget"] = controller.targets.resolve(binding)
                 if receipt := request.get("queueIntent"):
                     if not controller.import_pending(receipt):
                         f.unlink()
@@ -516,8 +681,10 @@ def tick():
                 req=starting
                 if not receive_pending(req):
                     return 0.1
-                with bpy.context.temp_override(**viewport()):
-                    state = target_state(bpy.context)
+                binding = req.get("importTarget")
+                material = req.get("mode") == 1 and not req.get("action")
+                with bpy.context.temp_override(**viewport(binding)):
+                    state = binding["selection"] if binding and material else target_state(bpy.context, material=material)
                 project = Path(bpy.data.filepath).parent
                 if not _pool:_pool=ThreadPoolExecutor(max_workers=1)
                 _task = dict(request=req, state=state, blend=bpy.data.filepath,
@@ -525,8 +692,9 @@ def tick():
                 note("正在收集所选文件到项目目录")
         elif not _task.get("paths") and _task["future"].done():
             _task["paths"] = _task["future"].result()
-            with bpy.context.temp_override(**viewport()):
-                if _task["request"].get("action") in {"textures","repair"} or _task["state"] == target_state(bpy.context):
+            req = _task["request"]
+            with bpy.context.temp_override(**viewport(req.get("importTarget"))):
+                if req.get("action") in {"textures","repair"} or _task["state"] == target_state(bpy.context, material=req.get("mode")==1):
                     bpy.ops.fabshelf.receive()
                 else:
                     note("选择已改变。请在 Blender 的 Fab 面板确认导入目标。")
@@ -551,8 +719,7 @@ def submit_project_requests(context, requests):
 def enqueue_project_requests(context, requests):
     if not _session.get("gallery"):open_gallery(context)
     controller=_session["gallery"]
-    requests = [req if "project_directory" in req else controller.project_request(dict(req, op="get"))
-                for req in requests]
+    requests = [controller.project_request(dict(req, op="get")) for req in requests]
     def submit():
         errors=[]
         for req in requests:
@@ -833,14 +1000,8 @@ class FAB_PT_panel(bpy.types.Panel):
             origin = project_assets.texture_origin(obj, material)
             if model := origin.get("modelMember"):
                 box.label(text=project_text("原始模型", "Original model") + " · " + Path(model).name)
-            if recipe := material.get("fab_recipe"):
-                try:
-                    values = json.loads(recipe)
-                    if "mapping" in values:
-                        mapping = project_text("开", "On") if values["mapping"] else project_text("关", "Off")
-                        box.label(text=project_text("导入配方", "Import recipe") + " · Mapping " + mapping)
-                except (ValueError, TypeError, AttributeError):
-                    pass
+            if recipe_summary := project_assets.material_recipe_summary(material):
+                box.label(text=project_text("导入配方", "Import recipe") + " · " + project_text(*recipe_summary))
             if src.get("bridge"):
                 box.label(text=project_text("换档请在副屏 Bridge 库重新导入", "Choose another resolution in the Bridge library"))
             elif src.get("uid") and (origin.get("modelFormat") or origin.get("fmt")) != "GLB":

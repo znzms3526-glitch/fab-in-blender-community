@@ -3,6 +3,7 @@ from collections import OrderedDict
 import hashlib
 import tempfile
 from zipfile import BadZipFile
+import zlib
 import json
 from math import ceil
 import os
@@ -28,6 +29,7 @@ LIBRARY_SNAPSHOT_BYTES = 512 * 1024
 LIBRARY_SNAPSHOT_ACCOUNTS = 8
 PACKAGE_DIMENSION_CACHE_LIMIT = 512
 _import_dispatch = ContextVar("fab_import_dispatch", default=None)
+_submission = ContextVar("fab_project_submission", default=None)
 CACHE_WRITES = {
     "addNativeAsset", "bridgeCancel", "bridgeImport", "bridgePublish", "bridgeRemove", "bridgeScan",
     "clearCovers", "clearJobs", "control", "deleteLocal", "favorite", "freeInfo", "freePause", "freeStart",
@@ -61,6 +63,7 @@ def file_format(f):
     name=f["name"].lower()
     if name.endswith(".glb") or f.get("format")=="glb":return "GLB"
     if f.get("format")=="fbx" or name.endswith(".fbx"):return "FBX"
+    if f.get("format")=="additional-files" and Path(name).suffix.lower() in catalog.IMAGES|{".zip"}:return "附件"
     if f.get("format") in ("texture-set","textures") or Path(name).suffix in catalog.IMAGES:return "贴图"
     return ""
 
@@ -70,7 +73,10 @@ def cached_format(record):
 
 
 def cached_resolution(record):
-    return catalog.size(record["name"]) or catalog.quality(record["name"])
+    is_quixel = variants.is_quixel_package(
+        record.get("name", ""), origin=record.get("origin", ""), quixel_id=record.get("quixel_id", "")
+    )
+    return variants.named_size(record["name"], quixel=is_quixel) or catalog.size(record["name"]) or catalog.quality(record["name"])
 
 
 def supported_files(rows):
@@ -80,7 +86,16 @@ def supported_files(rows):
             continue
         fmt=file_format(f)
         if fmt and Path(f["name"]).suffix.lower() in catalog.IMAGES|catalog.MODELS|{".zip"}:
-            files.append(dict(f,k=catalog.size(f["name"]) or catalog.quality(f["name"]),fmt=fmt))
+            nominal_k = variants.named_size(f["name"])
+            pkg_tier = variants.package_tier(f["name"])
+            files.append(dict(
+                f,
+                k=nominal_k or 0,
+                nominalK=nominal_k,
+                packageTier=pkg_tier,
+                fmt=fmt,
+                attachment=(fmt == "附件"),
+            ))
     return files
 
 
@@ -94,10 +109,24 @@ def listing_uid(value):
 urlopen=network.opener("system","")
 
 
+def project_journal(cache, project):
+    directory = cache / "queues" / hashlib.sha256(project.casefold().encode()).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def adopt_queue(origin, project):
+    # Only journals first opened for this unsaved document are passed here.
+    destination = project_journal(origin.parent.parent, project)
+    (destination / (origin.name + ".origin")).touch(exist_ok=True)
+
+
 class Gallery:
-    def __init__(self,cache,box,project=None,manage_auth=False, *, settings=None, switching_from=None):
+    def __init__(self,cache,box,project=None,manage_auth=False, *, settings=None, switching_from=None, targets=None):
         self.cache,self.box=cache,box
         self.project_scope=project
+        self.targets=targets
+        self.active_document=targets.latest["document"] if targets else None
         self.settings_path=cache/"preferences.json"
         self.settings=cache_settings(cache) if settings is None else network.validate(settings)
         self.manage_auth=manage_auth
@@ -143,9 +172,10 @@ class Gallery:
         self.jobs={}
         self.journal=None
         self.leases={}
+        self.retired_jobs={}
+        self.retry_restore_at=None
         if project:
-            self.journal=cache/"queues"/hashlib.sha256(project.casefold().encode()).hexdigest()
-            self.journal.mkdir(parents=True,exist_ok=True)
+            self.journal=project_journal(cache, project)
             self.restore_jobs()
         self.facets={}
         self.claims=FreeTask(self)
@@ -154,6 +184,7 @@ class Gallery:
         self.local={}
         self.local_by_asset={}
         self.package_dimensions=OrderedDict()
+        self.package_lods=OrderedDict()
         self.record_stamp=None
         self.record_versions={}
         self.cover_pool=ThreadPoolExecutor(max_workers=6,thread_name_prefix="FabCover")
@@ -219,6 +250,10 @@ class Gallery:
                     fileLabel=file_label,
                     connection=self.connection,taskState="运行中" if self.claims.running else "空闲",defaultCache=str(Path.home()/"FabShelfCache"),
                     lastError=self.last_error,lastTest=self.last_test,
+                    presetSizes=dict(variants.PRESET_SIZE),
+                    meshTiers=dict(variants.TIER_LABELS),
+                    meshPresets=dict(variants.TIER_SHORT_LABELS),
+                    textureSizes=[1,2,4,8],
                     version=".".join(map(str,bl_info["version"])),**self.cache_path_info())
 
     def clear_online_caches(self):
@@ -250,10 +285,10 @@ class Gallery:
             return uid,self.library_revision
 
     def cancel_other_account_jobs(self, account):
-        for job in self.jobs.values():
+        for job in [*self.jobs.values(), *self.retired_jobs.values()]:
             if job["state"] in {"完成", "已取消"} or not job.get("account") or job["account"] == account:
                 continue
-            job.update(state="已取消", receipt=None, error="Fab 账号已变更，请从当前账号重新提交")
+            job.update(state="已取消", receipt=None, error="Fab 账号已变更，请从当前账号重新提交", notice="")
             self.persist(job)
             if not job["active"]:
                 job["part"].unlink(missing_ok=True)
@@ -439,11 +474,43 @@ class Gallery:
         self.last_test=dict(network.measure(proxy,cdn),proxy=proxy)
         return self.last_test
 
-    def lease(self,jid):
+    def use_project(self, project, *, first_save, document):
+        with self.lock:
+            self.active_document = None
+            destination = project_journal(self.cache, project)
+            if destination == self.journal:
+                self.project_scope, self.active_document = project, document
+                return
+            if first_save:
+                # Adopt the temporary queue in place. Open part files and their process
+                # locks stay valid even when saving halfway through a transfer.
+                if self.jobs:
+                    adopt_queue(self.journal, project)
+            else:
+                for jid, job in list(self.jobs.items()):
+                    lease = self.leases.pop(jid, None)
+                    if job["active"] or job.get("receipt"):
+                        job["_retired_lease"] = lease
+                        self.retired_jobs[job["_journal"], jid] = job
+                    else:
+                        if job["state"] == "等待":
+                            job["state"] = "暂停"
+                            self.persist(job)
+                        if lease:
+                            lease.close()
+                    del self.jobs[jid]
+                for lease in self.leases.values():
+                    lease.close()
+                self.leases.clear()
+            self.project_scope, self.journal = project, destination
+            self.active_document = document
+            self.restore_jobs()
+
+    def lease(self,jid,journal=None):
         from .desktop import lock_file
         if jid in self.leases:return True
         name=hashlib.sha256(jid.encode()).hexdigest()
-        f=storage.fs_path(self.journal/(name+".lock")).open("a+b")
+        f=storage.fs_path((journal or self.journal)/(name+".lock")).open("a+b")
         if f.tell()==0:f.write(b"0");f.flush()
         f.seek(0)
         try:lock_file(f)
@@ -463,6 +530,9 @@ class Gallery:
             lease.__exit__(None, None, None)
 
     def write_import_request(self, request, q=None):
+        origin = self.submission_target(q or {})
+        if origin:
+            request = dict(request, importTarget=origin)
         current = _import_dispatch.get()
         if current and current[0] is self:
             _, job = current
@@ -474,12 +544,18 @@ class Gallery:
             job.update(state="等待", receipt=receipt)
         else:
             with self.lock:
+                if self.stop.is_set():
+                    raise ValueError("窗口已关闭")
+                self.check_submission_project(origin)
                 if self.queued_file(request.get("source", {}).get("file")):
                     raise ValueError("该文件已有任务，请打开下载队列查看")
                 catalog.atomic_json(self.box/(uuid.uuid4().hex+".json"), request)
 
     def pending_import_job(self, receipt):
         job = self.jobs.get(receipt.get("job")) if isinstance(receipt, dict) else None
+        if isinstance(receipt, dict) and (not job or job.get("receipt") != receipt.get("id")):
+            job = next((item for item in self.retired_jobs.values()
+                        if item["id"] == receipt.get("job") and item.get("receipt") == receipt.get("id")), None)
         if (job and job["state"] == "等待" and job.get("receipt")
                 and job["receipt"] == receipt.get("id") and self.job_account_current(job)):
             return job
@@ -488,20 +564,30 @@ class Gallery:
         with self.lock:
             return self.pending_import_job(receipt) is not None
 
-    def finish_import_intent(self, receipt, success, error=""):
+    def finish_import_intent(self, receipt, success, error="", *, notice=""):
         with self.lock:
             if job := self.pending_import_job(receipt):
                 job.update(state="完成" if success else "失败", receipt=None,
-                           error="" if success else str(error or "导入未完成，请在队列中继续"))
+                           error="" if success else str(error or "导入未完成，请在队列中继续"),
+                           notice=(notice or job.get("notice", "")) if success else "")
                 self.persist(job)
 
     def persist(self,j):
+        with self.lock:
+            self._persist(j)
+            if "_retired_lease" in j and not j["active"] and not j.get("receipt"):
+                if lease := j.pop("_retired_lease"):
+                    lease.close()
+                self.retired_jobs.pop((j["_journal"], j["id"]), None)
+
+    def _persist(self,j):
         if j["active"] or j["state"] == "等待":
             self.hold_job_asset(j)
         else:
             self.release_job_asset(j)
-        if not self.journal:return
-        path=storage.fs_path(self.journal/(hashlib.sha256(j["id"].encode()).hexdigest()+".json"))
+        journal = j.setdefault("_journal", self.journal)
+        if not journal:return
+        path=storage.fs_path(journal/(hashlib.sha256(j["id"].encode()).hexdigest()+".json"))
         if j["state"] in {"已取消", "完成"}:
             path.unlink(missing_ok=True)
         else:
@@ -510,6 +596,12 @@ class Gallery:
                 data["task"] = j["task"]
             if j.get("receipt"):
                 data["awaitingImport"] = True
+            if j["state"] == "待选择":
+                data["awaitingChoice"] = True
+                if j.get("notice"):
+                    data["notice"] = j["notice"]
+                if j.get("confirmations"):
+                    data["confirmations"] = j["confirmations"]
             for key in ("account", "cachedHash", "verifiedDownload"):
                 if j.get(key):
                     data[key] = j[key]
@@ -517,25 +609,51 @@ class Gallery:
             catalog.atomic_json(path,data)
 
     def restore_jobs(self):
-        for removal in self.journal.glob("*.removal"):
+        self.retry_restore_at = None
+        journals = [self.journal]
+        for marker in sorted(self.journal.glob("*.origin")):
+            if re.fullmatch(r"[0-9a-f]{64}", marker.stem):
+                journals.append(self.journal.parent / marker.stem)
+        for journal in journals:
+            for key, job in list(self.retired_jobs.items()):
+                if key[0] == journal and job["id"] not in self.jobs:
+                    self.retired_jobs.pop(key)
+                    if lease := job.pop("_retired_lease"):
+                        self.leases[job["id"]] = lease
+                    self.jobs[job["id"]] = job
+            self.restore_journal(journal)
+
+    def restore_journal(self, journal):
+        for removal in journal.glob("*.removal"):
             try:
                 with storage.file_lock(removal.with_suffix(".lock")):
                     storage.recover_removal(self.cache, removal)
             except (OSError, ValueError):
                 continue
-        for path in storage.fs_path(self.journal).glob("*.json"):
+        for path in storage.fs_path(journal).glob("*.json"):
+            acquired = None
             try:
                 path = storage.fs_path(path)
                 j=json.loads(path.read_text(encoding="utf8"))
-                if not re.fullmatch(r"[0-9a-f]{32}\.part",j["part"]) or not self.lease(j["id"]):continue
-                if not path.exists():continue
+                jid = j["id"]
+                if not isinstance(jid, str) or path.stem != hashlib.sha256(jid.encode()).hexdigest() or jid in self.jobs:
+                    continue
+                if not self.lease(jid, journal):
+                    self.retry_restore_at = time.monotonic() + 2
+                    continue
+                acquired = jid
+                # The previous writer may have finished or replaced the record while we acquired its lease.
+                j=json.loads(path.read_text(encoding="utf8"))
+                if j["id"] != jid or not re.fullmatch(r"[0-9a-f]{32}\.part",j["part"]):
+                    continue
                 part=self.cache/"partial"/j["part"]
                 cached = j.get("cachedHash","")
                 blob = self.cache/"packages"/cached
                 done = part.stat().st_size if part.is_file() else 0
                 if re.fullmatch(r"[a-f0-9]{64}", cached) and blob.is_file():
                     done = blob.stat().st_size
-                j.update(part=part,state="暂停",done=done,active=False,speed=0,route="",error="",restored=True)
+                j.update(part=part,state="暂停",done=done,active=False,speed=0,route="",error="",restored=True,
+                         _journal=journal)
                 legacy = j.pop("intents", [])
                 pending = next((item for item in legacy if item["state"] not in {"applied", "done"}), None)
                 if legacy and pending is None:
@@ -550,14 +668,21 @@ class Gallery:
                             break
                 if task := j.get("task"):
                     task["request"].setdefault("project_directory", "")
-                if j.pop("awaitingImport", False) or (pending and pending["state"] in {"dispatched", "review"}):
+                if j.pop("awaitingChoice", False):
+                    j["state"] = "待选择"
+                elif j.pop("awaitingImport", False) or (pending and pending["state"] in {"dispatched", "review"}):
                     j["notice"] = "请核对工程后再继续上次导入"
                 self.jobs[j["id"]]=j
-            except (OSError,ValueError,KeyError):continue
+                acquired = None
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            finally:
+                if acquired is not None:
+                    self.leases.pop(acquired).close()
 
     def busy(self):
         with self.lock:
-            return self.cache_writes or self.claims.running or self.bridge.running or self.pending_exports or any(
+            return self.cache_writes or self.claims.running or self.bridge.running or self.pending_exports or bool(self.retired_jobs) or any(
                 j["active"] or j["state"]=="等待"
                 for j in self.jobs.values() if j["state"]!="已取消")
 
@@ -625,12 +750,16 @@ class Gallery:
     def close(self):
         self.claims.pause.set()
         self.stop.set()
+        if self.targets:
+            self.targets.close()
         if self.auth and self.auth.poll() is None:self.auth.terminate()
         self.cover_pool.shutdown(wait=False,cancel_futures=True)
         self.pool.shutdown(wait=False,cancel_futures=True)
         with self.lock:
             for j in self.jobs.values():
                 if not self.journal and not j["active"]:j["part"].unlink(missing_ok=True)
+                if not j["active"] and (lease := self.leases.pop(j["id"], None)):
+                    lease.close()
 
     def join(self):
         self.thread.join()
@@ -646,6 +775,11 @@ class Gallery:
         if self.bridge.worker:self.bridge.worker.join()
         for job in self.jobs.values():
             self.release_job_asset(job)
+        for job in self.retired_jobs.values():
+            self.release_job_asset(job)
+            if lease := job.pop("_retired_lease", None):
+                lease.close()
+        self.retired_jobs.clear()
         for lease in self.leases.values():lease.close()
         self.leases.clear()
     def texture_dimensions(self,record):
@@ -671,6 +805,42 @@ class Gallery:
             if len(self.package_dimensions) > PACKAGE_DIMENSION_CACHE_LIMIT:
                 self.package_dimensions.popitem(last=False)
         return dimensions
+
+    def package_lod(self, record):
+        if record.get("kind") != "3d-model":
+            return None
+        digest, name = record["hash"], record["name"]
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            return None
+        blob = storage.fs_path(self.cache / "packages" / digest)
+        fingerprint = catalog.package_fingerprint(blob)
+        if fingerprint is None:
+            return None
+        key = (digest, ".zip" if name.lower().endswith(".zip") else name)
+        with self.lock:
+            lods_cache = getattr(self, "package_lods", None)
+            if lods_cache is None:
+                lods_cache = self.package_lods = OrderedDict()
+            cached = lods_cache.get(key)
+            if cached is not None and cached[0] == fingerprint:
+                lods_cache.move_to_end(key)
+                return cached[1]
+        try:
+            names = catalog.local_files(self.cache, record)
+            models = [n for n in names if Path(n).suffix.lower() in catalog.MODELS]
+            primary = catalog.pick_primary_model(models, title=record.get("title") or name) if models else None
+            lod = catalog.geometry_lod(primary) if primary else None
+        except (OSError, ValueError, BadZipFile):
+            return None
+        with self.lock:
+            lods_cache = getattr(self, "package_lods", None)
+            if lods_cache is None:
+                lods_cache = self.package_lods = OrderedDict()
+            lods_cache[key] = (fingerprint, lod)
+            lods_cache.move_to_end(key)
+            if len(lods_cache) > PACKAGE_DIMENSION_CACHE_LIMIT:
+                lods_cache.popitem(last=False)
+        return lod
 
     def record_local(self, record):
         digest=record["hash"]
@@ -912,7 +1082,9 @@ class Gallery:
                         self.latest_page=q.get("id")
                     self._dispatch_request(q)
                 with self.lock:
-                    if not any(j["active"] for j in self.jobs.values()):
+                    if self.retry_restore_at is not None and time.monotonic() >= self.retry_restore_at:
+                        self.restore_jobs()
+                    if not any(j["active"] for j in (*self.jobs.values(), *self.retired_jobs.values())):
                         j=next((j for j in self.jobs.values() if j["state"]=="等待" and not j.get("receipt")),None)
                         if j:
                             j.update(active=True,state="下载中")
@@ -1073,14 +1245,29 @@ class Gallery:
         self.assets[uid]=r
         with self.lock:
             copies=list(self.local_by_asset.get(uid,{}).values())
-        variants=[dict(hash=a["hash"],file=a.get("file"),k=cached_resolution(a),fmt=cached_format(a),dimensions=sorted(set(tuple(v) for v in self.texture_dimensions(a).values() if v)),name=a["name"],bytes=a.get("bytes",0)) for a in copies]
+        variants_list=[]
+        for a in copies:
+            dims_map=self.texture_dimensions(a)
+            dims=sorted({tuple(v) for v in dims_map.values() if v})
+            unverified=sum(1 for v in dims_map.values() if v is None)
+            is_quixel=variants.is_quixel_package(a["name"],origin=a.get("origin",""),quixel_id=a.get("quixel_id",""))
+            nominal_k=variants.named_size(a["name"],quixel=is_quixel)
+            pkg_tier=variants.package_tier(a["name"])
+            variants_list.append(dict(
+                hash=a["hash"],file=a.get("file"),k=cached_resolution(a),
+                nominalK=nominal_k,packageTier=pkg_tier,lod=self.package_lod(a),
+                fmt=cached_format(a),dimensions=dims,
+                unverifiedTextures=unverified,
+                hasTextures=bool(dims_map),
+                name=a["name"],bytes=a.get("bytes",0),
+            ))
         key=hashlib.sha256(uid.encode()).hexdigest()+".img"
         thumb=r.get("thumb","")
         preview=self.cache/"previews"/key
         if preview.exists():
             try:os.utime(preview,None);thumb="https://covers.invalid/"+key
             except FileNotFoundError:pass
-        return dict(uid=uid,title=r.get("title") or r.get("name") or uid,kind=r.get("kind",""),thumb=thumb,local=variants,localOnly=not bool(r.get("uid")),discovery=bool(r.get("discovery")) and not bool(variants),favorite=self.favorite_path(uid).exists())
+        return dict(uid=uid,title=r.get("title") or r.get("name") or uid,kind=r.get("kind",""),thumb=thumb,local=variants_list,localOnly=not bool(r.get("uid")),discovery=bool(r.get("discovery")) and not bool(variants_list),favorite=self.favorite_path(uid).exists())
 
     def downloaded_covers(self):
         uids = set(self.local_by_asset) | set(self.bridge.cards())
@@ -1712,13 +1899,14 @@ class Gallery:
                 family=catalog.model_family_members(meshes,title=title,sizes=member_sizes) if model else []
                 tiers=catalog.model_tier_members(family,title=title,sizes=member_sizes) if family else {}
                 converted=fmt=="GLB" and record.get("format")=="converted-files"
-                key=(variants.format_rank(dict(format=fmt,converted=converted)),variants.mesh_family(family[0]) if family else ())
+                pkg_tier=variants.package_tier(record["name"])
+                key=(variants.format_rank(dict(format=fmt,converted=converted)),variants.mesh_family(family[0]) if family else (),pkg_tier)
                 numbered={member:catalog.geometry_lod(member) for member in family}
                 levels={number for number in numbered.values() if number is not None}
                 if levels and key[1]:
                     groups.setdefault(key,set()).update(levels)
-                inventory.append((record,names,file_ids,fmt,meshes,tiers,converted,key,numbered))
-        for record,names,file_ids,fmt,meshes,tiers,converted,key,numbered in inventory:
+                inventory.append((record,names,file_ids,fmt,meshes,family,tiers,converted,pkg_tier,key,numbered))
+        for record,names,file_ids,fmt,meshes,family,tiers,converted,pkg_tier,key,numbered in inventory:
             available=groups.get(key,())
             tier=target.get("modelTier")
             member=target.get("modelMember") or tiers.get(tier)
@@ -1727,6 +1915,8 @@ class Gallery:
                 if any(number is not None for number in numbered.values()):
                     member=min((name for name,number in numbered.items() if number is not None),
                                key=lambda name:(abs(numbered[name]-level),numbered[name],name))
+            if not target.get("modelMember") and model and member is None and family:
+                member = family[0]
             if model and member not in meshes:
                 continue
             request=dict(q,recipe=recipe,textureK=target["textureK"],modelFormat=fmt)
@@ -1735,10 +1925,21 @@ class Gallery:
             try:
                 plan=self.local_import(record,cached_resolution(record),request,names,recipe=recipe)
             except catalog.AmbiguousTextureSelection as error:
-                conflicts.append(str(error))
+                conflicts.append(dict(
+                    message=str(error),
+                    channel=error.channel,
+                    slot=error.slot,
+                    candidates=error.candidates,
+                    localHash=record["hash"],
+                    format=fmt,
+                    modelMember=member,
+                    name=record["name"],
+                    bytes=record.get("bytes",0),
+                ))
                 continue
             except (OSError,ValueError,BadZipFile):
                 continue
+            dims_map=self.texture_dimensions(record)
             dimensions=plan["source"].get("textureSizes",[None])
             pixels=target["textureK"]*1024
             size_match=all(max(size)==pixels for size in dimensions if size) if any(dimensions) else None
@@ -1747,15 +1948,32 @@ class Gallery:
             label=variants.mesh_hint(member,member=True) if member else None
             lod=catalog.geometry_lod(member) if member else None
             many=len(set(tiers.values()))>1
-            mesh_match=(lod==variants.wanted_level(available,tier) if available and lod is not None else
-                        member==tiers.get(tier) if many else not label or label==tier)
-            actual_tier=(label or (tier if many and mesh_match else None)) if lod is None else None
+            if available and lod is not None:
+                mesh_match = lod == variants.wanted_level(available, tier)
+            elif many:
+                mesh_match = member == tiers.get(tier)
+            elif pkg_tier in variants.TIERS:
+                mesh_match = pkg_tier == tier
+            elif pkg_tier == "raw":
+                mesh_match = tier == "raw"
+            elif label is not None:
+                mesh_match = label == tier
+            else:
+                mesh_match = None
+            actual_tier=(label or pkg_tier or (tier if many and mesh_match else None)) if lod is None else None
+            tag_tier=variants.mesh_tag_tier(record["name"]) or (variants.mesh_tag_tier(member) if member else None)
+            is_quixel=variants.is_quixel_package(record["name"],members=names,origin=record.get("origin",""),quixel_id=record.get("quixel_id",""))
+            nominal_k=variants.named_size(record["name"],quixel=is_quixel,members=names)
+            has_textures=bool(plan.get("attachments")) or any(Path(n).suffix.lower() in catalog.IMAGES for n in names) or any(k.endswith("#image-0") for k in dims_map)
+            unverified=sum(1 for v in dims_map.values() if v is None)
             if member:
                 plan["source"].update(modelTier=actual_tier,requestedModelTier=tier)
             candidates.append(dict(local=True,record=record,plan=plan,localHash=record["hash"],fileIds=file_ids,
                 name=record["name"],format=fmt,converted=converted,dimensions=sorted(set(size for size in dimensions if size)),
                 textureMatch=size_match,meshMatch=mesh_match,modelMember=member,lod=lod,family=variants.mesh_family(member) if member else (),
                 levels=available if lod in available else (),modelTier=actual_tier,modelTiers=tiers if member else None,
+                packageTier=pkg_tier,meshTagTier=tag_tier,explicitSize=variants.explicit_size(record["name"]),
+                nominalK=nominal_k,textureK=nominal_k,hasTextures=has_textures,unverifiedTextures=unverified,
                 bytes=record.get("bytes",0)))
         return candidates, inspected, conflicts
 
@@ -1766,10 +1984,15 @@ class Gallery:
         for file in files or ():
             if file["uid"] in inspected or file["fmt"] not in ({"FBX","GLB"} if model else {"贴图"}):
                 continue
-            named_size=variants.named_size(file["name"])
+            is_quixel=variants.is_quixel_package(file["name"])
+            explicit=variants.explicit_size(file["name"])
+            named_size=variants.named_size(file["name"],quixel=is_quixel)
+            pkg_tier=variants.package_tier(file["name"])
+            tag_tier=variants.mesh_tag_tier(file["name"])
             mesh=variants.mesh_hint(file["name"]) if model else None
             rows.append(dict(file=file,fileId=file["uid"],name=file["name"],format=file["fmt"],bytes=file["bytes"],
-                converted=(file.get("format")=="converted-files"),textureK=named_size,modelTier=mesh,
+                converted=(file.get("format")=="converted-files"),textureK=named_size,nominalK=named_size,
+                explicitSize=explicit,packageTier=pkg_tier,meshTagTier=tag_tier,modelTier=mesh,
                 textureMatch=variants.match(named_size,target["textureK"]),
                 meshMatch=variants.match(mesh,target["modelTier"]) if model else True,
                 lod=variants.filename_lod(file["name"]) if model else None,
@@ -1779,6 +2002,7 @@ class Gallery:
     @staticmethod
     def variant_description(candidate):
         keys=("local","format","converted","localHash","fileId","modelMember","modelTier","modelTiers",
+              "packageTier","nominalK","hasTextures","unverifiedTextures",
               "lod","name","bytes","dimensions","textureK")
         return {key:candidate[key] for key in keys if candidate.get(key) is not None}
 
@@ -1813,7 +2037,7 @@ class Gallery:
             tier=target["modelTier"]
             lod=chosen.get("lod")
             geometry_known=(lod==0 if tier=="high" else len(chosen.get("levels",()))>1) if lod is not None else (
-                chosen.get("modelTier")==tier)
+                chosen.get("packageTier")==tier or chosen.get("modelTier")==tier)
             needs_options=(verified is not None or variants.format_rank(chosen)>0 or chosen["textureMatch"] is not True
                            or (target.get("preset") and not geometry_known))
         if needs_options and asset.get("uid") and "localHash" not in target and not downloaded:
@@ -1830,19 +2054,33 @@ class Gallery:
                 if not account:
                     raise ValueError("请先登录 Fab")
             except (OSError,ValueError):
-                if state not in {"confirm","chosen"}:
+                if state not in {"confirm","chosen","missing_raw"}:
                     raise
             else:
+                sidecar = next((file for file in files
+                                if file["uid"] == target.get("fileId") and file["fmt"] in {"附件", "贴图"}), None)
+                if sidecar and asset.get("kind") == "3d-model":
+                    if q.get("import"):
+                        raise ValueError("这是附加贴图包，请先下载，再从模型详情选择并导入")
+                    if q.get("preview"):
+                        return dict(state="download", fileId=sidecar["uid"], format=sidecar["fmt"])
+                    command = dict(uid=uid, file=sidecar["uid"], k=sidecar["k"], fmt=sidecar["fmt"])
+                    message = self.enqueue(command, dict(asset=asset, files=files, account=account))
+                    return dict(state="cached" if message == "该规格已缓存" else "queued", message=message, file=sidecar["uid"])
                 remote=self.remote_variant_rows(files,asset,target,inspected)
-                state,chosen = variants.resolve_variant_plan(target,local+remote)
-        if downloaded and verified and target.get("preset")=="high":
-            account,files=verified["account"],verified["files"]
+                state,chosen = variants.resolve_variant_plan(target,local+remote,downloaded=downloaded)
+        if downloaded and verified and target.get("preset") == "high":
+            account, files = verified["account"], verified["files"]
             inspected.add(q["_selectedTransfer"])
-            remote=self.remote_variant_rows(files,asset,target,inspected)
-        if state=="chosen":
-            chosen=variants.high_geometry_probe(target,chosen,local,remote) or chosen
+            remote = self.remote_variant_rows(files, asset, target, inspected)
+        if state == "chosen":
+            chosen = variants.high_geometry_probe(target, chosen, local, remote) or chosen
+        if state=="missing_raw":
+            return dict(state="missing",message="该资产仅提供 Raw 原版，请在详情中确认规格")
         if state=="missing":
-            return dict(state="missing",message=conflicts[0] if conflicts else "此商品无可用的 Blender 格式")
+            if conflicts:
+                return dict(state="confirm",message=conflicts[0]["message"],choices=conflicts)
+            return dict(state="missing",message="此商品无可用的 Blender 格式")
         if state=="confirm":
             return dict(state="confirm",message="请确认可用的资产规格",
                         choices=[self.variant_description(row) for row in chosen])
@@ -1850,21 +2088,39 @@ class Gallery:
         if chosen.get("local"):
             dimensions = chosen["dimensions"]
             actual = " / ".join(f"{w}×{h}" for w,h in dimensions)
-            notice = f"包内贴图 {actual}" if actual else "贴图尺寸待确认"
-            if q.get("import") and not q.get("preview"):
+            actual_ks = sorted({max(pair)//1024 for pair in dimensions if max(pair)%1024==0})
+            nominal_k = chosen.get("nominalK")
+            importing = bool(q.get("import") and not q.get("preview"))
+            if nominal_k and dimensions and any(max(pair)!=nominal_k*1024 for pair in dimensions):
+                actual_k_label = "/".join(f"{k}K" for k in actual_ks) if actual_ks else actual
+                notice = f"标称 {nominal_k}K，实测 {actual_k_label}（{actual}）"
+                if importing:
+                    chosen["plan"]["actualSpecNotice"] = notice
+                else:
+                    notice += "，已缓存"
+            elif dimensions:
+                if len(dimensions) > 1:
+                    edges = sorted({max(pair) for pair in dimensions})
+                    actual_range = f"{edges[0]}–{edges[-1]}"
+                    notice = f"实测 {actual_range}" + ("（部分核验）" if chosen.get("unverifiedTextures") else "")
+                else:
+                    notice = f"实测 {actual}" + ("（部分核验）" if chosen.get("unverifiedTextures") else "")
+            else:
+                notice = ""
+            if importing:
                 self.emit_import(chosen["plan"],frozen)
-            message = self.import_notice() if q.get("import") and not q.get("preview") else "该规格已缓存"
-            return dict(description,state="cached",message=f"{message} · {notice}",notice=notice)
+            message = self.import_notice() if importing else "该规格已缓存"
+            full_message = f"{message} · {notice}" if notice else message
+            return dict(description,state="cached",message=full_message,notice=notice)
         if q.get("preview"):
             return dict(description,state="download")
         file=chosen["file"]
-        keep=("action","target","shared","project_directory","independent","import","selection","recipe")
+        keep=("action","target","shared","project_directory","independent","import","selection","recipe","attachments")
         plan={key:frozen[key] for key in keep if key in frozen}
         plan["import"]=bool(plan.get("import"))
         plan["_selectedTransfer"]=file["uid"]
-        if target.get("preset")=="high":
-            # Keep only uninspected files in a continuation so the queue cannot revisit a probe.
-            files=[candidate for candidate in files if candidate["uid"] not in inspected]
+        if target.get("preset") == "high":
+            files = [candidate for candidate in files if candidate["uid"] not in inspected]
         snapshot=dict(asset=asset,files=files,account=account)
         message=self.enqueue(dict(uid=uid,k=file["k"],fmt=file["fmt"],file=file["uid"]),snapshot,variant=plan)
         return dict(description,state="queued",message=message,file=file["uid"])
@@ -1941,6 +2197,7 @@ class Gallery:
         return job if job and (job["active"] or job["state"] in {"等待", "下载中", "暂停"}) else None
 
     def enqueue(self,q,verified=None,*,variant=None):
+        origin = self.submission_target(q)
         if q.get("import") and "project_directory" not in q:
             q=dict(q,project_directory=self.project_directory)
         self.refresh_local()
@@ -1948,6 +2205,7 @@ class Gallery:
         if q.get("action")=="textures":
             return self.request_variant(dict(q,textureK=k))["message"]
         with self.lock:
+            self.check_submission_project(origin)
             if verified and not self.job_account_current(verified):
                 raise ValueError("Fab 账号已变更，请从当前账号重新提交")
             if self.queued_file(q.get("file")):
@@ -1980,6 +2238,7 @@ class Gallery:
         kind, request = ("variant", dict(variant, files=opts)) if variant is not None else (
             "intent", q if q.get("import") else None)
         with self.lock:
+            self.check_submission_project(origin)
             if not self.job_account_current({"account": account}):
                 raise ValueError("Fab 账号已变更，请从当前账号重新提交")
             if self.queued_file(f["uid"]):
@@ -1987,15 +2246,19 @@ class Gallery:
                 if current and current[0] is self:
                     raise ValueError("该文件已有任务，请打开下载队列查看")
                 return "该文件已有任务，请打开下载队列查看"
-            if self.journal and not self.lease(f["uid"]):raise ValueError("另一个 Blender 窗口正在处理此规格")
-            task = None if request is None else dict(kind=kind, request=json.loads(json.dumps(request, ensure_ascii=False)))
             old = self.jobs.get(f["uid"])
+            journal = old.get("_journal", self.journal) if old else self.journal
+            if journal and not self.lease(f["uid"], journal):raise ValueError("另一个 Blender 窗口正在处理此规格")
+            task = None if request is None else dict(kind=kind, request={key:value for key,value in request.items() if key!="_origin"})
+            if task:
+                task = json.loads(json.dumps(task, ensure_ascii=False))
             if old and old["state"] == "失败" and old.get("account") == account:
                 job = dict(old, task=task, state="等待", error="", notice="")
             else:
                 job=dict(id=f["uid"],asset=dict(r),file=f,title=r.get("title") or r.get("name"),state="等待",active=False,
                          account=account,task=task,done=0,total=f["bytes"] or 0,speed=0,route="",error="",etag="",
                          part=self.cache/"partial"/(uuid.uuid4().hex+".part"))
+            job.update(_journal=journal, _origin=origin)
             try:
                 self.persist(job)
             except BaseException:
@@ -2086,12 +2349,70 @@ class Gallery:
             edge = next(iter(pixels)) if len(pixels)==1 else 0
             source["textureSizes"] = sizes
             source["k"] = edge//1024 if edge % 1024 == 0 else 0
+        attachments_spec = []
+        att_records = q.get("attachments") or []
+        if not att_records and mode == 0 and source.get("fmt") == "FBX" and not any(
+                Path(n).suffix.lower() in catalog.IMAGES for n in chosen) and not original_files and r.get("uid"):
+            # Auto-pair ONLY if there is a single cached texture/attachment package for this listing
+            # whose texture set uniquely matches the model or title (never guess on Untitled).
+            with self.lock:
+                sibling_recs = [
+                    c for c in self.local_by_asset.get(r["uid"], {}).values()
+                    if c["hash"] != r["hash"] and cached_format(c) in {"贴图", "附件"}
+                    and (self.cache / "packages" / c["hash"]).is_file()
+                ]
+            if len(sibling_recs) == 1:
+                cand = sibling_recs[0]
+                cand_names = catalog.local_files(self.cache, cand)
+                cand_images = [n for n in cand_names if Path(n).suffix.lower() in catalog.IMAGES]
+                if cand_images:
+                    title_toks = {t for t in re.findall(r"[a-z0-9]+", (r.get("title") or "").casefold()) if len(t) >= 2}
+                    model_toks = {t for t in re.findall(r"[a-z0-9]+", Path(model).stem.casefold()) if len(t) >= 2}
+                    hints = title_toks | model_toks
+                    if any(hints & set(catalog.parse_texture(n)["set_key"][1]) for n in cand_images):
+                        att_records = [{"hash": cand["hash"]}]
+
+        if att_records:
+            tex_k = q.get("textureK", k)
+            for att_item in att_records:
+                att_hash = att_item.get("hash") or att_item.get("localHash")
+                if not att_hash:
+                    continue
+                with self.lock:
+                    att_rec = self.local_by_asset.get(r.get("uid") or r["hash"], {}).get(att_hash)
+                if (not att_rec or att_hash == r["hash"] or cached_format(att_rec) not in {"贴图", "附件"}
+                        or not catalog.package_valid(self.cache, att_hash, att_rec.get("bytes"))):
+                    raise ValueError("所选附件缓存不存在，请重新下载")
+                att_names = catalog.local_files(self.cache, att_rec)
+                att_chosen = att_item.get("files")
+                if att_chosen is None:
+                    att_chosen = catalog.default_files(
+                        att_names,
+                        tex_k,
+                        scene.role,
+                        dimensions=self.texture_dimensions(att_rec),
+                        channels=recipe["channels"] if recipe is not None else None,
+                        height_mode=recipe["heightMode"] if recipe is not None else "off",
+                    )
+                elif not set(att_chosen) <= set(att_names):
+                    raise ValueError("所选附件成员不存在")
+                if att_chosen:
+                    attachments_spec.append(dict(
+                        hash=att_rec["hash"],
+                        name=att_rec["name"],
+                        files=att_chosen,
+                        source=self.import_source(att_rec, tex_k),
+                    ))
+                    source.setdefault("attachments", []).append(dict(hash=att_rec["hash"], members=att_chosen))
+
         source["members"]=chosen
         request=dict(hash=r["hash"],name=r["name"],source=source,mode=mode,files=chosen)
         if recipe is not None:
             request["recipe"]=recipe
         if original_files:
             request["originalFiles"]=original_files
+        if attachments_spec:
+            request["attachments"]=attachments_spec
         return request
 
     def emit_import(self,request,q):
@@ -2195,18 +2516,44 @@ class Gallery:
             if record.get("file")!=file["uid"] and file["uid"] not in record.get("fileIds", ()):
                 continue
             expected = file.get("bytes") or record.get("bytes")
-            if catalog.package_valid(self.cache, record["hash"], expected):
-                return record
+            if not catalog.package_valid(self.cache, record["hash"], expected):
+                continue
+            if j.get("_check_zip") and Path(file["name"]).suffix.lower() == ".zip":
+                path = storage.fs_path(self.cache / "packages" / record["hash"])
+                stamp = catalog.package_fingerprint(path)
+                try:
+                    if not storage.verify_zip(path, lambda: self.stop.is_set() or j["state"] != "下载中"):
+                        return None
+                except (BadZipFile, zlib.error, EOFError):
+                    storage.discard_broken_blob(self.cache, record["hash"], stamp)
+                    continue
+                j.pop("_check_zip", None)
+            return record
         return None
 
     def commit_download(self, j, verified, incoming):
+        digest, count = verified["hash"], verified["bytes"]
+        f, asset = j["file"], j["asset"]
+        if Path(f["name"]).suffix.lower() == ".zip":
+            path = storage.fs_path(incoming or self.cache / "packages" / digest)
+            stamp = catalog.package_fingerprint(path)
+            try:
+                if not storage.verify_zip(path, lambda: self.stop.is_set() or j["state"] != "下载中"):
+                    return None
+            except (BadZipFile, zlib.error, EOFError) as error:
+                if incoming:
+                    path.unlink(missing_ok=True)
+                else:
+                    storage.discard_broken_blob(self.cache, digest, stamp)
+                with self.lock:
+                    j.pop("verifiedDownload", None)
+                    j.update(done=0, etag="")
+                raise ValueError("ZIP 下载包损坏或不完整，请重新下载") from error
         with self.lock:
             if j["state"]!="下载中" or self.stop.is_set():
                 return None
-            digest, count = verified["hash"], verified["bytes"]
             j.update(verifiedDownload=verified, done=count, total=count)
             self.persist(j)
-            f, asset = j["file"], j["asset"]
             record = dict(hash=digest, name=f["name"], file=f["uid"], uid=asset["uid"], title=asset["title"],
                           kind=asset["kind"], thumb=asset.get("thumb",""), format=f["format"], bytes=count)
             record = catalog.install_package(self.cache, incoming, record)
@@ -2285,14 +2632,39 @@ class Gallery:
             if task["kind"] == "variant":
                 snapshot = dict(asset=job["asset"], files=plan["files"], account=job["account"])
                 selection = {key: value for key, value in plan.items() if key != "files"}
+                if "selection" in plan:
+                    selection_obj = dict(selection.get("selection") or {})
+                    preset = selection_obj.get("preset")
+                    probe = (plan.get("import") and preset == "high"
+                             and not variants.package_tier(record["name"])
+                             and variants.filename_lod(record["name"]) != 0)
+                    if not probe:
+                        selection_obj.pop("preset", None)
+                        if preset in variants.PRESET_SIZE and selection_obj.get("textureK") is None:
+                            selection_obj["textureK"] = variants.PRESET_SIZE[preset]
+                        if preset in variants.TIERS and job["asset"].get("kind") == "3d-model" and not selection_obj.get("modelTier"):
+                            selection_obj["modelTier"] = preset
+                        selection_obj.update(mode="locked", localHash=record["hash"])
+                        selection_obj.pop("fileId", None)
+                    selection["selection"] = selection_obj
                 result = self.request_variant(dict(selection, uid=job["asset"]["uid"]), snapshot)
-                message = result.get("message") or "请在详情中核对可用规格"
-                job["notice"] = result.get("notice") or message
-                if plan.get("import") and not job.get("receipt") and result["state"] != "queued":
-                    raise ValueError(message+" · 请在详情中选择可用文件")
+                if result["state"] == "confirm":
+                    job.update(
+                        state="待选择",
+                        error="",
+                        notice=result.get("message") or "请在详情中手动选择",
+                        confirmations=result.get("choices", []),
+                    )
+                    return
+                if result["state"] == "missing":
+                    job["notice"] = ""
+                    raise ValueError(result.get("message") or "Fab 文件没有可导入的模型或贴图")
+                job["notice"] = result.get("notice") or ""
+                job["error"] = ""
+                job.pop("confirmations", None)
             else:
                 self.send(record, job["file"]["k"], plan)
-            if not job.get("receipt"):
+            if not job.get("receipt") and job["state"] not in {"待选择", "已取消", "失败"}:
                 job["state"] = "完成"
         finally:
             _import_dispatch.reset(token)
@@ -2320,7 +2692,7 @@ class Gallery:
                 self.dispatch_job(j, rec)
                 path.unlink(missing_ok=True)
         except Exception as e:
-            if j["state"]=="下载中":j.update(state="失败",error=str(e))
+            if j["state"]=="下载中":j.update(state="失败",error=str(e),notice="")
         finally:
             with self.lock:
                 j["active"]=False
@@ -2329,17 +2701,18 @@ class Gallery:
 
     def drop_job(self, jid):
         job = self.jobs.get(jid)
-        if not job or job["active"] or job["state"] not in {"完成", "已取消", "失败"}:
+        if not job or job["active"] or job["state"] not in {"完成", "已取消", "失败", "待选择"}:
             return False
         owned_lease = jid in self.leases
-        if self.journal and not self.lease(jid):
+        journal = job.get("_journal", self.journal)
+        if journal and not self.lease(jid, journal):
             raise ValueError("另一个 Blender 窗口正在使用该任务，请稍后重试")
         removed = False
         try:
-            if self.journal:
+            if journal:
                 name = hashlib.sha256(jid.encode()).hexdigest()
-                record = self.journal / (name + ".json")
-                removal = self.journal / (name + ".removal")
+                record = journal / (name + ".json")
+                removal = journal / (name + ".removal")
                 with storage.removing_files(self.cache, removal, [job["part"], record]):
                     pass
             else:
@@ -2369,20 +2742,90 @@ class Gallery:
             removed_blob = catalog.delete_package_record(self.cache, digest, uid, favorite)
             self.forget_local(asset_key, digest)
             if removed_blob:
-                for key in tuple(self.package_dimensions):
-                    if key[0] == digest:
-                        self.package_dimensions.pop(key)
+                for cache_map in (self.package_dimensions, getattr(self, "package_lods", None)):
+                    if cache_map is None:
+                        continue
+                    for key in tuple(cache_map):
+                        if key[0] == digest:
+                            cache_map.pop(key)
             if not uid:
                 self.assets.pop(digest, None)
             self.record_stamp = None
         return dict(message="已删除本地缓存文件", hash=digest, uid=uid, removedBlob=removed_blob)
 
     def project_request(self,q):
-        if q.get("op") in {"get","variant","send","queueListing","bridgeImport"}:
-            return dict(q,project_directory=self.project_directory)
+        op = q.get("op")
+        if op in {"get","variant","send","queueListing","bridgeImport","submitBatch","control","clearJobs"}:
+            q = dict(q)
+            if op not in {"control", "clearJobs"}:
+                q.setdefault("project_directory", self.project_directory)
+            if targets := getattr(self, "targets", None):
+                selection = op in {"send","bridgeImport"} or q.get("action") == "resume" or bool(q.get("import"))
+                q["_origin"] = targets.capture(selection=selection)
         return q
 
+    def submission_target(self, q):
+        dispatch = _import_dispatch.get()
+        if dispatch and dispatch[0] is self:
+            return dispatch[1].get("_origin")
+        submission = _submission.get()
+        return submission[1] if submission and submission[0] is self else q.get("_origin")
+
+    def check_submission_project(self, origin):
+        if origin and origin["document"] != self.active_document:
+            raise ValueError("工程或场景发生改变，请从资产库重新发送")
+
+    def send_pending_choice(self, q):
+        self.refresh_local()
+        with self.lock:
+            job = self.jobs.get(q["job"])
+            check_account = job and job.get("restored") and self.library_account is None
+        if check_account:
+            self.library_session()
+        with self.lock:
+            self.check_submission_project(self.submission_target(q))
+            if (not job or self.jobs.get(q["job"]) is not job or job["state"] != "待选择"
+                    or job["active"] or not self.job_account_current(job)
+                    or q.get("uid") != job["asset"]["uid"] or q.get("hash") != job.get("cachedHash")):
+                raise ValueError("Fab 账号或任务状态已变更，请重新提交")
+            record = self.selected_copy(q)
+            previous = job.copy()
+            job["_origin"] = self.submission_target(q)
+            self.hold_job_asset(job)
+            job["state"] = "下载中"
+            token = _import_dispatch.set((self, job))
+            try:
+                self.send(record, int(q["k"]), q)
+                job.update(error="", notice="", task=dict(kind="intent", request={**q, "import": True}))
+                job.pop("confirmations", None)
+                self.persist(job)
+            except Exception:
+                self.release_job_asset(job)
+                job.clear()
+                job.update(previous)
+                raise
+            finally:
+                _import_dispatch.reset(token)
+            return self.import_notice()
+
     def handle(self,q):
+        if "_origin" not in q and getattr(self, "targets", None):
+            q = self.project_request(q)
+        if "_origin" not in q:
+            return self._handle(q)
+        q = dict(q)
+        origin = q.pop("_origin")
+        self.check_submission_project(origin)
+        displayed_document = q.pop("queueDocument", None)
+        if displayed_document and displayed_document != origin["document"]:
+            raise ValueError("工程已改变，请重新查看当前工程的队列")
+        token = _submission.set((self, origin))
+        try:
+            return self._handle(q)
+        finally:
+            _submission.reset(token)
+
+    def _handle(self,q):
         op=q["op"]
         if op=="projectState":return self.project_state
         if op == "bridgeStatus":
@@ -2484,7 +2927,11 @@ class Gallery:
         if op=="taxonomy":return self.taxonomy(idle=q.get("idle") is True)
         if op=="cover":return self.cover(q["uid"])
         if op=="localFeedCard":return self.local_feed_card(q)
-        if op=="card":return self.card(self.assets[q["uid"]])
+        if op=="card":
+            with self.lock:
+                record=self.assets.get(q["uid"]) or next(iter(self.local_by_asset.get(q["uid"],{}).values()),None)
+            if not record:raise ValueError("找不到资产来源")
+            return self.card(record)
         if op=="page":
             if q.get("refresh"):self.facets.clear()
             return self.page(q)
@@ -2534,11 +2981,22 @@ class Gallery:
                 allowed=catalog.enabled_texture_roles(recipe["channels"],recipe["heightMode"])
                 disabled=[name for name in names if Path(name).suffix.lower() in catalog.IMAGES
                           and scene.role(Path(name)) not in allowed]
+            attachments=[]
+            if r.get("uid"):
+                with self.lock:
+                    attachments=[
+                        dict(hash=c["hash"],name=c["name"],fmt=cached_format(c),bytes=c.get("bytes",0))
+                        for c in self.local_by_asset.get(r["uid"],{}).values()
+                        if c["hash"]!=r["hash"] and cached_format(c) in {"贴图","附件"}
+                        and (self.cache/"packages"/c["hash"]).is_file()
+                    ]
             return dict(names=names,files=request["files"],mode=request["mode"],modelCount=len(models),
-                        conflict=conflict,disabled=disabled)
+                        conflict=conflict,disabled=disabled,attachments=attachments)
         if op=="deleteLocal":
             return self.delete_local(q)
         if op=="send":
+            if q.get("job"):
+                return self.send_pending_choice(q)
             self.send(self.selected_copy(q),int(q["k"]),q);return self.import_notice()
         if op=="pick":
             rec=catalog.add_package(self.cache,Path(q["path"]))
@@ -2559,15 +3017,18 @@ class Gallery:
                     row = {key:job[key] for key in ("id","title","state","done","total","speed","route","error","active")}
                     plan = (job.get("task") or {}).get("request", {})
                     selection = plan.get("selection", {})
-                    row.update(uid=job["asset"]["uid"], k=job["file"].get("k",0), fmt=job["file"].get("fmt",""),
+                    row.update(queueDocument=self.active_document, uid=job["asset"]["uid"], k=job["file"].get("k",0), fmt=job["file"].get("fmt",""),
                                notice=job.get("notice",""), textureK=selection.get("textureK", plan.get("textureK")),
                                modelTier=selection.get("modelTier", selection.get("preset")),
                                pendingImports=int(bool(job.get("receipt"))),
-                               directory=str(self.cache/"packages") if job["state"]=="完成" else "")
+                               cachedHash=job.get("cachedHash"),
+                               confirmations=job.get("confirmations",[]),
+                               directory=str(self.cache/"packages") if job["state"] in {"完成","待选择"} else "")
                     rows.append(row)
                 return rows
         if op=="clearJobs":
             with self.lock:
+                self.check_submission_project(self.submission_target(q))
                 targets=[jid for jid,j in list(self.jobs.items()) if not j["active"] and j["state"] in {"完成","已取消","失败"}]
                 removed = blocked = 0
                 for jid in targets:
@@ -2591,6 +3052,7 @@ class Gallery:
                 if check_account:
                     self.library_session()
             with self.lock:
+                self.check_submission_project(self.submission_target(q))
                 action=q["action"]
                 j=self.jobs.get(q["job"])
                 if j is None:
@@ -2608,13 +3070,18 @@ class Gallery:
                     self.jobs={v["id"]:v for v in ordered}
                 if action=="pause" and j["state"] in {"等待","下载中"}:
                     j.update(state="暂停", receipt=None)
-                elif action=="resume" and not j["active"] and j["state"] in {"暂停","失败"}:
+                elif action=="resume" and not j["active"] and j["state"] in {"暂停","失败","待选择"}:
                     if not self.job_account_current(j):
                         raise ValueError("任务与当前 Fab 账号不一致，请从当前资产库重新选择文件")
                     self.hold_job_asset(j)
+                    j["_origin"] = self.submission_target(q)
+                    if j.get("restored") or "CRC" in j["error"] or "ZIP 下载包损坏" in j["error"]:
+                        j["_check_zip"] = True
                     j.update(state="等待",error="",notice="")
+                    j.pop("confirmations",None)
                 elif action=="cancel" and j["state"]!="完成":
                     j.update(state="已取消", receipt=None)
+                    j.pop("confirmations",None)
                     if not j["active"]:j["part"].unlink(missing_ok=True)
                 self.persist(j)
             return "队列已更新"

@@ -28,8 +28,9 @@ function importOptions(target,initial){
  nodes.append(el("legend",null,"Blender 材质节点"),mapLabel);
  const preset=el("fieldset","import-preset-settings"), options=el("div","import-preset-options");
  const group="fab-import-tier-"+target.id;
- const tiers=Object.entries(meshTiers).map(([key,text])=>{
-   const label=el("label",null,text), radio=el("input");
+ const tiers=["low","medium","high"].map(key=>{
+   const text=meshTiers[key]||key;
+   const label=el("label",null,tr(text)+" · "+presetTextureSize[key]+"K"), radio=el("input");
    radio.type="radio";radio.name=group;radio.value=key;radio.checked=initial.modelTier===key;
    label.prepend(radio);options.append(label);
    return radio;
@@ -132,7 +133,19 @@ async function refreshRoutes(r,force=false){
    if(r===prefState&&$("#preferences").open)$("#detected").textContent=tr(e.message);
  }finally{r.resolvingRoutes=false}
 }
+function syncTierTable(r){
+ if(!r)return;
+ if(r.presetSizes)presetTextureSize=r.presetSizes;
+ if(r.meshTiers)meshTiers=r.meshTiers;
+ if(r.meshPresets)meshPresets=r.meshPresets;
+ if(Array.isArray(r.textureSizes))textureSizes=r.textureSizes;
+ for(const [key,label] of Object.entries(meshPresets)){
+   const opt=$("#batchTier")?.querySelector('option[value="'+key+'"]');
+   if(opt)opt.textContent=tr(label)+" · "+presetTextureSize[key]+"K";
+ }
+}
 function paintPrefs(r){
+ syncTierTable(r);
  prefState=r;fields(r.values);paintCacheSwitch();paintRoutes(r);applyImportPreferences(r.values.import);
  probeProxy=r.lastTest?.proxy??r.values.proxy;renderMeasurement(r.lastTest);
 }
@@ -171,7 +184,7 @@ $("#prefSave").onclick=async()=>{
  }
  catch(e){$("#prefMsg").textContent=tr(e.message)}finally{$("#prefSave").disabled=cacheSwitchPending()}
 };
-rpc("settings").then(r=>{applyImportPreferences(r.values.import);applyLanguage(r.values.language);if(!$("#claim").open){$("#range").value=r.values.range;$("#license").value=r.values.tier}});
+rpc("settings").then(r=>{syncTierTable(r);applyImportPreferences(r.values.import);applyLanguage(r.values.language);if(!$("#claim").open){$("#range").value=r.values.range;$("#license").value=r.values.tier}});
 
 
 

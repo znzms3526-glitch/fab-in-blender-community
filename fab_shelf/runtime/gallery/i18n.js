@@ -112,7 +112,8 @@ const phrases={
 "无法读取本地缓存索引，请稍后重试":"Could not read the local cache records. Try again.",
 "本地缓存文件正在使用，或没有删除权限，请稍后重试":"The cached file is in use or cannot be removed. Try again.",
 "本地缓存文件已删除，请重新下载":"The cached file was deleted. Download it again.",
-" · 有 ":" · "," 条任务暂无法移除，请稍后重试":" tasks could not be removed. Try again."
+" · 有 ":" · "," 条任务暂无法移除，请稍后重试":" tasks could not be removed. Try again.",
+"目标：":"Target: ","包标称：":"Package label: ","本地：":"Local: ","需要手选贴图":"Manual texture selection needed","实测 ":"Measured ","（部分核验）":" (partially verified)","（包内标签）":" (package tag)","包内无贴图":"No textures in package","无可用贴图，已用安全材质":"No usable textures; safe material used","待选择":"Selection needed","选择规格":"Choose variant","去详情选择":"Choose files in details","附件":"Attachment","附加贴图包":"Attachment texture pack","自动（不附加）":"Auto (no attachment)","原材质":"Original material","已重连":"Relinked","无贴图回退":"No-texture fallback"
 };
 const exactLabels=new Set(["返回","移除","Fab 下载","本地文件"]);
 const fragments=Object.keys(phrases).filter(k=>k.length>1&&!exactLabels.has(k)).sort((a,b)=>b.length-a.length);

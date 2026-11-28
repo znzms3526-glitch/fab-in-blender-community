@@ -146,6 +146,32 @@ def locate(library, target):
     return False
 
 
+def _cleanup_dangling_images(scene_mod=None):
+    import bpy
+    from fab_shelf import scene as _scene_mod
+
+    mod = scene_mod if hasattr(scene_mod, "_sanitize_broken_images") else _scene_mod
+    for mat in bpy.data.materials:
+        mod._sanitize_broken_images(mat)
+    seen = set()
+    for group in bpy.data.node_groups:
+        if group in seen:
+            continue
+        seen.add(group)
+        for node in group.nodes:
+            if node.type == "TEX_IMAGE" and node.image is not None and not mod._is_usable_image(node.image):
+                node.image = None
+    for mat in bpy.data.materials:
+        if not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is not None and not mod._is_usable_image(node.image):
+                node.image = None
+    for img in list(bpy.data.images):
+        if not img.users:
+            bpy.data.images.remove(img)
+
+
 def build(cache, request, output):
     import bpy
     from fab_shelf import project_assets, scene, storage
@@ -161,6 +187,23 @@ def build(cache, request, output):
                           project_layout=False, checks=checks)
     staged = dict(zip(members, paths))
     selected = [staged[member] for member in request["files"]]
+    att_paths = []
+    att_records = {}
+    for att in request.get("attachments", ()):
+        att_files = att.get("files") or []
+        if not att_files:
+            continue
+        att_checks = {}
+        att_req = dict(hash=att["hash"], name=att.get("name", ""), files=att_files, mode=1,
+                       source=att.get("source") or {})
+        att_staged = storage.stage(cache, output.parent / "files", att_req, project_layout=False, checks=att_checks)
+        for member, p in zip(att_files, att_staged):
+            att_paths.append(p)
+            att_records[storage.resolved_path(p)] = (
+                att.get("source") or {"hash": att["hash"], "name": att.get("name", "")},
+                member,
+                att_checks.get(member),
+            )
     source = project_assets.model_source(request["source"].copy(), request["files"])
     recipe = request.get("recipe")
     verified_size = scene.expected_texture_size(source)
@@ -170,42 +213,77 @@ def build(cache, request, output):
     origin = "Quixel Bridge · " + source["quixel_id"] if source.get("bridge") else source.get("url")
     title, label, spec = asset_labels(request)
     fmt = source.get("fmt", "")
-    if request["mode"] == 0:
-        objects = scene.import_files(bpy.context, selected, 0, title, texture_size=verified_size,
-                                     recipe=recipe, original_images=tuple(staged[member] for member in originals))
-        if (not any(obj.type == "MESH" for obj in objects)
-                or any(obj.type not in {"MESH", "EMPTY"} or obj.animation_data for obj in objects)
-                or bpy.data.actions):
-            raise ValueError("资产库首版仅支持静态模型")
-        if len(objects) == 1:
-            asset = objects[0]
+    outcomes = {}
+    try:
+        if request["mode"] == 0:
+            objects = scene.import_files(
+                bpy.context, [*selected, *att_paths], 0, title,
+                recipe=recipe, original_images=tuple(staged[member] for member in originals),
+                outcomes=outcomes,
+            )
+            if (not any(obj.type == "MESH" for obj in objects)
+                    or any(obj.type not in {"MESH", "EMPTY"} or obj.animation_data for obj in objects)
+                    or bpy.data.actions):
+                raise ValueError("资产库首版仅支持静态模型")
+            if len(objects) == 1:
+                asset = objects[0]
+            else:
+                asset = bpy.data.collections.new(label)
+                bpy.context.scene.collection.children.link(asset)
+                for obj in objects:
+                    asset.objects.link(obj)
+                    for previous in list(obj.users_collection):
+                        if previous != asset:
+                            previous.objects.unlink(obj)
         else:
-            asset = bpy.data.collections.new(label)
-            bpy.context.scene.collection.children.link(asset)
-            for obj in objects:
-                asset.objects.link(obj)
-                for previous in list(obj.users_collection):
-                    if previous != asset:
-                        previous.objects.unlink(obj)
-    else:
-        objects = []
-        asset = scene.build_material(title, selected, False, recipe=recipe)
-        scene.require_texture_size([asset], verified_size)
+            objects = []
+            asset = scene.build_material(title, [*selected, *att_paths], False, recipe=recipe)
+            if not any(scene._is_usable_image(n.image) for n in scene.material_image_nodes(asset.node_tree)):
+                raise ValueError("材质缺少可用的贴图")
+            outcomes[asset] = {
+                "policy": "rebuilt",
+                "channels": scene._material_used_channels(asset),
+                "mapping": bool(recipe and recipe.get("mapping")),
+            }
 
-    tag = json.dumps(source, ensure_ascii=True)
-    for block in [*objects, *bpy.data.materials, asset]:
-        block["fab_source"] = tag
-    if effective_recipe := project_assets.material_recipe(request):
+        _cleanup_dangling_images(scene)
+
+        tag = json.dumps(source, ensure_ascii=True)
+        for block in [*objects, *bpy.data.materials, asset]:
+            block["fab_source"] = tag
+        effective_recipe = project_assets.material_recipe(request)
         for mat in bpy.data.materials:
-            mat["fab_recipe"] = json.dumps(effective_recipe, sort_keys=True)
-    members_by_location = {storage.resolved_path(path): member for member, path in staged.items()}
-    for image in bpy.data.images:
-        if not image.users or image.source != "FILE":
-            continue
-        location = storage.resolved_path(bpy.path.abspath(image.filepath))
-        member = members_by_location.get(location)
-        if not image.packed_file:
-            if member is None or not storage.fs_path(location).is_file():
+            outcome = outcomes.get(mat)
+            if outcome:
+                if outcome["policy"] == "rebuilt":
+                    applied = dict(effective_recipe or {})
+                    applied.update(
+                        builderVersion=project_assets._BUILDER_VERSION,
+                        materialPolicy="rebuilt",
+                        mapping=outcome["mapping"],
+                        channels=outcome["channels"],
+                    )
+                    mat["fab_recipe"] = json.dumps(applied, sort_keys=True)
+                else:
+                    mat["fab_recipe"] = json.dumps(
+                        dict(builderVersion=project_assets._BUILDER_VERSION, materialPolicy=outcome["policy"]),
+                        sort_keys=True,
+                    )
+            elif effective_recipe and effective_recipe.get("materialPolicy") == "preserve":
+                mat["fab_recipe"] = json.dumps(effective_recipe, sort_keys=True)
+
+        members_by_location = {storage.resolved_path(path): member for member, path in staged.items()}
+        for image in bpy.data.images:
+            if not image.users or image.source != "FILE":
+                continue
+            if image.packed_file:
+                continue
+            location = storage.resolved_path(bpy.path.abspath(image.filepath))
+            member = members_by_location.get(location)
+            img_source, img_check = source, checks.get(member)
+            if member is None and location in att_records:
+                img_source, member, img_check = att_records[location]
+            if member is None or not storage.fs_path(location).is_file() or min(image.size) <= 0:
                 raise ValueError("缺少可打包的贴图 · " + location.name)
             # Packing in an unsaved worker document needs an absolute source path.
             image.filepath = str(storage.fs_path(location))
@@ -213,28 +291,30 @@ def build(cache, request, output):
             if not image.packed_file:
                 raise ValueError("无法打包贴图 · " + location.name)
             image.filepath = "//" + location.name
-        if member is not None:
-            project_assets._remember_image(image, source, member, checks.get(member))
+            project_assets._remember_image(image, img_source, member, img_check)
 
-    asset.name = label
-    asset.asset_mark()
-    metadata = asset.asset_data
-    metadata.description = "\n".join(v for v in (origin, spec) if v)
-    origin_tag = "Bridge" if source.get("bridge") else "Fab"
-    for tag_name in dict.fromkeys(v for v in (origin_tag, fmt, f'{source["k"]}K' if source.get("k") else "") if v):
-        metadata.tags.new(tag_name)
-    preview_id = "bridge:" + source["quixel_id"] if source.get("bridge") else uid or request["hash"]
-    key = hashlib.sha256(preview_id.encode()).hexdigest()
-    preview = cache / "previews" / (key + ".img")
-    if preview.is_file():
-        try:
-            with bpy.context.temp_override(id=asset):
-                bpy.ops.ed.lib_id_load_custom_preview(filepath=str(preview))
-        except RuntimeError:
-            pass
-    if not asset.preview or not asset.preview.image_size[0]:
-        asset.asset_generate_preview()
-    bpy.ops.wm.save_as_mainfile(filepath=str(output), compress=True)
+        asset.name = label
+        asset.asset_mark()
+        metadata = asset.asset_data
+        metadata.description = "\n".join(v for v in (origin, spec) if v)
+        origin_tag = "Bridge" if source.get("bridge") else "Fab"
+        for tag_name in dict.fromkeys(v for v in (origin_tag, fmt, f'{source["k"]}K' if source.get("k") else "") if v):
+            metadata.tags.new(tag_name)
+        preview_id = "bridge:" + source["quixel_id"] if source.get("bridge") else uid or request["hash"]
+        key = hashlib.sha256(preview_id.encode()).hexdigest()
+        preview = cache / "previews" / (key + ".img")
+        if preview.is_file():
+            try:
+                with bpy.context.temp_override(id=asset):
+                    bpy.ops.ed.lib_id_load_custom_preview(filepath=str(preview))
+            except RuntimeError:
+                pass
+        if not asset.preview or not asset.preview.image_size[0]:
+            asset.asset_generate_preview()
+        bpy.ops.wm.save_as_mainfile(filepath=str(output), compress=True)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
 
 
 if __name__ == "__main__":

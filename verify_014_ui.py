@@ -1,4 +1,6 @@
 """Drive the real gallery HTML in WebView2 using a read-only synthetic Fab library."""
+import ctypes
+from ctypes import wintypes
 import json
 import os
 from pathlib import Path
@@ -7,12 +9,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from zipfile import ZipFile
 
 REPO = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO))
 from fab_shelf import catalog, gallery
 
-UI_SCRIPT = """
+UI_SCRIPT = r"""
 async function waitFor(test, message) {
   const limit = performance.now() + 7000;
   while (performance.now() < limit) {
@@ -171,6 +174,120 @@ async function verifyAccountSwitchWait(search) {
     rpc = baseRpc;
   }
 }
+async function verifyQueueUi() {
+  const statusText = row => row.querySelector("small").textContent;
+  const findJob = id => document.querySelector('[data-job="' + id + '"]');
+  const labelButton = (target, label) => [...target.querySelectorAll("button")].find(b => b.textContent === tr(label));
+  await rpc("verifyPrepareJobs");
+  document.querySelector("#transfer").click();
+  await poll();
+  await waitFor(() => findJob("fixture-failed") && findJob("fixture-conflict"), "Queue rows did not appear");
+  const bad = findJob("fixture-failed");
+  if (statusText(bad).split("Fixture transfer failure").length !== 2) throw Error("Queue echoed the same error and notice");
+  const retry = labelButton(bad,"继续");
+  retry.focus();
+  await rpc("verifyUpdateJobs");
+  await poll();
+  await waitFor(() => findJob("fixture-progress").querySelector("progress").value === 8, "Progress update did not render");
+  if (document.activeElement !== labelButton(findJob("fixture-failed"),"继续")) {
+    throw Error("Queue refresh lost the current keyboard action");
+  }
+  labelButton(findJob("fixture-conflict"),"去详情选择").click();
+  const details = document.querySelector("#inspect");
+  await waitFor(() => details.open && details.querySelectorAll(".conflict-candidate input").length === 2,
+                "Queue selection did not reach the manual file controls");
+  if (document.querySelector("#variantConfirm").open || !details.querySelector(".asset-options").open) {
+    throw Error("Conflict started another confirmation loop");
+  }
+  const candidate = details.querySelector(".conflict-candidate input");
+  candidate.click();
+  const submit = labelButton(details.querySelector(".asset-options"),"按所选文件导入");
+  submit.click();
+  submit.click();
+  await waitFor(() => !details.open && statusText(findJob("fixture-conflict")).startsWith(tr("等待导入")),
+                "Manual choice did not keep the queued Blender import receipt");
+  const result = await rpc("verifyQueueResult");
+  if (result.submitted !== 1) throw Error("Double-click sent more than one manual import");
+  document.querySelector('#scope [data-scope="owned"]').click();
+  document.querySelector("#query").value="switch-account";
+  document.querySelector("#query").dispatchEvent(new Event("input"));
+  await waitFor(() => tiles.has("fixture-switched"), "Returning from queue lost the signed-in view");
+}
+async function verifyRawAndKeyboard() {
+  const modelCard = tiles.get("fixture-switched");
+  const other = card({uid:"fixture-hovered",title:"Other card",kind:"3d-model",local:[]});
+  const details = document.querySelector("#inspect");
+  const querySelector = document.querySelector;
+  document.querySelector = function(selector) {
+    return selector === ".card:hover" ? other : querySelector.call(this,selector);
+  };
+  try {
+    modelCard.focus();
+    modelCard.dispatchEvent(new KeyboardEvent("keydown",{key:" ",code:"Space",bubbles:true,cancelable:true}));
+    if (!details.open || details.dataset.uid !== modelCard.dataset.uid) {
+      throw Error("Space opened the hovered card instead of the keyboard-focused card");
+    }
+  } finally {
+    document.querySelector=querySelector;
+    if(details.open)details.close();
+  }
+  modelCard.querySelector(".options").click();
+  await waitFor(() => details.querySelector('option[value="fixture-raw"]'),"Raw package did not appear in details");
+  const file = details.querySelector('option[value="fixture-raw"]').parentElement;
+  const size = details.querySelector(".remote-files .field select");
+  file.value="fixture-raw";
+  file.dispatchEvent(new Event("change"));
+  if (size.value !== "8") throw Error("Locking Raw kept the previous unrelated 4K value");
+  details.querySelector(".remote-files .primary").click();
+  await waitFor(() => !details.open,"Raw detail action did not queue the selected file");
+  if(!(await rpc("verifyQueueResult")).raw)throw Error("Raw selection was not sent as an 8K manual lock");
+  const localHash="c".repeat(64);
+  modelCard.asset.local=[{hash:localHash,fmt:"FBX",nominalK:8,packageTier:"raw",dimensions:[[8192,8192]],name:"Fixture_raw.zip"}];
+  modelCard.querySelector(".options").click();
+  const cachedFile=details.querySelector('option[value="' + localHash + '"]');
+  if(!cachedFile?.textContent.includes("Raw · 8192×8192"))throw Error("Cached Raw lost its explicit file label");
+  cachedFile.parentElement.value=localHash;
+  cachedFile.parentElement.dispatchEvent(new Event("change"));
+  details.querySelector(".local-actions .primary").click();
+  await waitFor(() => details.querySelector(".asset-feedback")?.textContent === "Fixture used cached Raw",
+                "Cached Raw did not import at the locked 8K specification");
+  details.close();
+  modelCard.asset.local=[{hash:"b".repeat(64),fmt:"附件",dimensions:[[4096,4096]],name:"Fixture_Textures.zip"}];
+  modelCard.refreshActions();
+  if(modelCard.querySelector(".actions .primary").textContent === tr("导入")){
+    throw Error("A local texture sidecar was offered as an importable mesh");
+  }
+  modelCard.querySelector(".options").click();
+  await waitFor(() => details.querySelector('option[value="fixture-attachment"]'), "Attachment did not appear in details");
+  if(details.querySelector(".local-actions"))throw Error("A local sidecar was listed as a cached mesh");
+  const attachedFiles=details.querySelector('option[value="fixture-attachment"]').parentElement;
+  attachedFiles.value="fixture-attachment";
+  attachedFiles.dispatchEvent(new Event("change"));
+  if(!details.querySelector(".remote-files .primary").hidden)throw Error("Attachment showed Download and import");
+  [...details.querySelectorAll(".remote-files button")].find(b=>b.textContent===tr("仅下载")).click();
+  await waitFor(() => !details.open, "Attachment download-only did not queue");
+  if(!(await rpc("verifyQueueResult")).attachment)throw Error("Attachment sent a mixed import/download action");
+}
+async function verifyNarrow() {
+  await rpc("verifyNarrow");
+  await waitFor(() => innerWidth <= 740 && matchMedia("(max-width:880px)").matches,
+                "Real WebView2 window did not reflow to narrow mode");
+  const width = innerWidth;
+  const buttons = [...document.querySelectorAll("#scope button:not([hidden]), #tools button:not([hidden])")];
+  if (getComputedStyle(document.querySelector("#scope")).display !== "flex" ||
+      document.documentElement.scrollWidth > width + 1 ||
+      buttons.some(button => {
+        const r = button.getBoundingClientRect();
+        return r.right > width + 1 && !button.closest("#scope");
+      })) throw Error("Narrow layout made toolbar actions overflow the viewport");
+  return width;
+}
+async function changeLanguage(value,phase) {
+  await openPreferences("界面");
+  document.querySelector("#language").value=value;
+  sessionStorage.setItem("verify-phase",phase);
+  await document.querySelector("#prefSave").onclick();
+}
 async function runFixture() {
   const cards = () => [...document.querySelectorAll("#grid .card")];
   const scroller = document.querySelector("#scroll");
@@ -219,6 +336,7 @@ async function runFixture() {
   await waitFor(() => document.querySelector("#feedStatus").textContent.includes("1010"), "Unknown end of feed");
   const uids = cards().map(card => card.dataset.uid);
   if (new Set(uids).size !== 1010 || cards()[0] !== first) throw Error("Duplicate or rebuilt feed cards");
+  if (cards().some(tile => tile.textContent.includes("贴图尺寸待确认"))) throw Error("The feed repeated unverified texture hints");
   toBottom();
   const top = document.querySelector("#backToTop");
   await waitFor(() => !top.hidden, "Back-to-top control did not appear");
@@ -243,13 +361,33 @@ async function runFixture() {
   document.querySelector("#menu").hidePopover();
   const modelCard = cards()[0];
   const labels = card => [...card.querySelectorAll(".levels button")].map(button => button.textContent);
+  const target = card => card.querySelector(".texture-info").textContent.split("\n")[0];
   if (modelCard.querySelector(".actions select") || labels(modelCard).join() !== ["低", "中", "高"].map(tr).join()) {
     throw Error("The model card must show only the three combined presets");
   }
   const materialCard = card({uid:"fixture-material",title:"Fixture material",kind:"material",local:[]});
-  if (labels(materialCard).join() !== "1K,2K,4K,8K") throw Error("The material card lost separate texture sizes");
+  const decalCard = card({uid:"fixture-decal",title:"Fixture decal",kind:"decal",local:[]});
+  if ([materialCard,decalCard].some(tile => labels(tile).join() !== "1K,2K,4K,8K" || target(tile) !== "目标：2K")) {
+    throw Error("Material/decal texture size controls or initial target are wrong");
+  }
+  if (target(modelCard) !== "目标：高模 · 4K" || modelCard.querySelector('.levels .chosen').dataset.variant !== "high") {
+    throw Error("Default high preset was not selected and labeled");
+  }
+  const sequence = [["low","低模","1"],["medium","中模","2"],["high","高模","4"],["low","低模","1"]];
+  for (const [tier,mesh,k] of sequence) {
+    modelCard.querySelector('[data-variant="' + tier + '"]').click();
+    if (target(modelCard) !== "目标：" + mesh + " · " + k + "K" ||
+        modelCard.querySelector('.levels [aria-pressed="true"]').dataset.variant !== tier) {
+      throw Error("Rapid preset change did not update the label and pressed state");
+    }
+  }
   const primary = modelCard.querySelector(".actions .primary");
   if (primary.textContent !== tr("获取并导入")) throw Error("An unverified model should show Get and import");
+  modelCard.asset.local = [{fmt:"FBX",lod:0,dimensions:[[4096,4096]]}];
+  modelCard.querySelector('[data-variant="high"]').click();
+  if (!modelCard.querySelector(".texture-info").textContent.includes("本地：LOD0 · 实测 4096×4096")) {
+    throw Error("Verified local LOD and dimensions were not shown separately from the target");
+  }
   modelCard.asset.local = [{fmt:"FBX",dimensions:[[2048,2048],[4096,4096]]}];
   modelCard.querySelector('[data-variant="high"]').click();
   if (primary.textContent !== tr("导入")) throw Error("Mixed-resolution cached models should show Import");
@@ -265,7 +403,8 @@ async function runFixture() {
   const channel = (view, name) => view.querySelector('.channel-picker input[data-channel="' + name + '"]');
   await waitFor(() => panel.querySelectorAll(".channel-picker input").length === Object.keys(importChannels).length,
                 "Shared import preferences did not appear");
-  if (extraChannels.some(name => channel(panel, name).checked) || !panel.querySelector(".import-height-options").hidden ||
+  if (existingChannels.some(name => !channel(panel, name).checked) ||
+      extraChannels.some(name => channel(panel, name).checked) || !panel.querySelector(".import-height-options").hidden ||
       !panel.querySelector(".import-node-settings input").checked ||
       panel.querySelector(".import-preset-options input:checked").value !== "high") {
     throw Error("The shared import defaults do not match the Bridge-style form");
@@ -275,6 +414,9 @@ async function runFixture() {
   const heightOptions = panel.querySelector(".import-height-options");
   if (heightOptions.hidden || heightOptions.querySelector("select").value !== "bump") {
     throw Error("Height opt-in did not reveal the default bump mode");
+  }
+  if ([...heightOptions.querySelectorAll("option")].map(option => option.textContent).join() !== "仅凹凸,真置换") {
+    throw Error("Height controls lost either Bump or Displacement");
   }
   height.click();
   channel(panel, "AO").click();
@@ -292,21 +434,94 @@ async function runFixture() {
   await waitFor(() => channel(panel, "Specular")?.checked && toolbar.textContent.endsWith("+2"),
                 "Toolbar settings did not reflect opt-in saved in full settings");
   panel.hidePopover();
+  await verifyQueueUi();
+  await verifyRawAndKeyboard();
+  const narrowWidth=await verifyNarrow();
+  await openPreferences("存储");
+  document.querySelector("#coverMiB").value="256";
+  await document.querySelector("#prefSave").onclick();
+  document.querySelector("#prefClose").click();
+  document.querySelector("#cache").click();
+  await waitFor(() => document.querySelector("#menu").textContent.includes("/ 256 MiB"),
+                "Cover cache popover did not adopt 256 MiB settings");
+  document.querySelector("#menu").hidePopover();
   return {cards: uids.length, cachePreview: true, earlyBatch: true, retry: true, silentHeadChange: true,
           selection: true, staleSearch: true, refreshedCursor:true, accountWait:true, coverLimit:true,
-          autoFileWithSharedImportSettings:true, classification};
+          autoFileWithSharedImportSettings:true, classification, narrowWidth, rapidPresets:true,
+          noUnverifiedSpam:true, rawLock:true, cachedRawLock:true, attachmentDownloadOnly:true, queueManualConflict:true,
+          keyboard:true, changedCoverLimit:256};
 }
-runFixture().then(result => chrome.webview.postMessage({op:"verifyFeedUi",report:result}),
-                  error => chrome.webview.postMessage({op:"verifyFeedUi",error:error.message}));
+async function roundTripLanguage() {
+  const phase = sessionStorage.getItem("verify-phase");
+  if (!phase) {
+    sessionStorage.setItem("verify-report",JSON.stringify(await runFixture()));
+    return changeLanguage("en","english");
+  }
+  await waitFor(() => tiles.has("fixture-switched"),"Language reload lost the user's library");
+  const cardText = tiles.get("fixture-switched").querySelector(".texture-info").textContent;
+  const closer = document.querySelector("#inspect header button").getAttribute("aria-label");
+  if (phase === "english") {
+    if (document.documentElement.lang !== "en" || !cardText.startsWith("Target: High · 4K") || closer !== "Close") {
+      throw Error("English reload did not translate target and Close consistently: " + cardText + " / " + closer);
+    }
+    if ((await verifyNarrow()) !== 720 || (await rpc("settings")).values.coverMiB !== 256) {
+      throw Error("English narrow layout or saved cache limit did not survive reload");
+    }
+    return changeLanguage("zh-CN","chinese");
+  }
+  if (document.documentElement.lang !== "zh-CN" || !cardText.startsWith("目标：高模 · 4K") || closer !== "关闭") {
+    throw Error("Chinese reload kept translated UI or incorrect model target");
+  }
+  const report=JSON.parse(sessionStorage.getItem("verify-report"));
+  chrome.webview.postMessage({op:"verifyFeedUi",report:{...report,languages:["zh-CN","en","zh-CN"]}});
+}
+roundTripLanguage().catch(error => chrome.webview.postMessage({op:"verifyFeedUi",error:error.message}));
 """
+
+
+def resize_gallery(pid, client_width):
+    user = ctypes.windll.user32
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user.EnumWindows.argtypes = [callback, wintypes.LPARAM]
+    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user.IsWindowVisible.argtypes = [wintypes.HWND]
+    windows = []
+
+    @callback
+    def collect(window, _):
+        owner = wintypes.DWORD()
+        user.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == pid and user.IsWindowVisible(window):
+            windows.append(window)
+        return True
+
+    user.EnumWindows(collect, 0)
+    window, = windows
+    outer, client = wintypes.RECT(), wintypes.RECT()
+    for operation in (user.GetWindowRect, user.GetClientRect):
+        operation.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    assert user.GetWindowRect(window, ctypes.byref(outer))
+    assert user.GetClientRect(window, ctypes.byref(client))
+    user.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    border = outer.right - outer.left - client.right
+    assert user.SetWindowPos(window, None, 0, 0, client_width + border, outer.bottom - outer.top, 0x16)
 
 
 def verify_feed_ui(root):
     runtime = REPO / "fab_shelf" / "runtime"
     host = root / "host"
-    shutil.copytree(runtime / "gallery", host / "gallery")
-    for name in ("Gallery091.exe", "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll", "WebView2Loader.dll"):
-        shutil.copyfile(runtime / name, host / name)
+    host_files = ("Gallery091.exe", "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll", "WebView2Loader.dll")
+    archive_file = os.environ.get("FAB_TEST_ARCHIVE")
+    if archive_file:
+        (host / "gallery").mkdir(parents=True)
+        with ZipFile(archive_file) as archive:
+            for relative in (*map(lambda p: f"gallery/{p.name}", sorted((runtime / "gallery").iterdir())), *host_files):
+                (host / relative).write_bytes(archive.read(f"fab_shelf/runtime/{relative}"))
+    else:
+        shutil.copytree(runtime / "gallery", host / "gallery")
+        for name in host_files:
+            shutil.copyfile(runtime / name, host / name)
     index = host / "gallery" / "index.html"
     index.write_text(index.read_text(encoding="utf8").replace("</body>", '<script src="verify.js"></script></body>'), encoding="utf8")
     (index.parent / "verify.js").write_text(UI_SCRIPT, encoding="utf8")
@@ -327,6 +542,14 @@ def verify_feed_ui(root):
     handle, fail_more, first_head = app.handle, True, True
     account = "fixture-account"
     reordered = False
+    job_rows = {}
+    submitted = 0
+    raw_locked = False
+    attachment_download = False
+    conflict_hash = "a" * 64
+    candidates = ["BaseColor_A.png", "BaseColor_B.png"]
+    conflict_choice = dict(localHash=conflict_hash, name="Conflict fixture", format="FBX",
+                           channel="Base Color", message="Fixture conflicting textures", candidates=candidates)
     order = list(range(1010))
     changed_order = [108 if i == 34 else i for i in range(35, -1, -1)] + [34] + [
         i for i in range(36, 1010) if i != 108]
@@ -367,10 +590,46 @@ def verify_feed_ui(root):
         raise AssertionError(op)
 
     def commands(query):
-        nonlocal reordered
+        nonlocal reordered, submitted, raw_locked, attachment_download
         if query["op"] == "verifyFeedUi":
             catalog.atomic_json(report, query)
             return True
+        if query["op"] == "verifyPrepareJobs":
+            for id_, state in (("fixture-failed", "失败"), ("fixture-progress", "下载中"), ("fixture-conflict", "待选择")):
+                job_rows[id_] = dict(id=id_, uid="fixture-switched", title=id_, state=state, done=4, total=16,
+                                     active=state == "下载中", route="", speed=0, directory="")
+            message = "Fixture transfer failure"
+            job_rows["fixture-failed"].update(error=message, notice=message)
+            job_rows["fixture-conflict"].update(confirmations=[conflict_choice])
+            return True
+        if query["op"] == "verifyUpdateJobs":
+            job_rows["fixture-progress"]["done"] = 8
+            return True
+        if query["op"] == "verifyQueueResult":
+            return dict(submitted=submitted, raw=raw_locked, attachment=attachment_download)
+        if query["op"] == "verifyNarrow":
+            resize_gallery(proc.pid, 720)
+            return True
+        if query["op"] == "jobs" and job_rows:
+            return list(job_rows.values())
+        if query["op"] == "card" and query["uid"] == "fixture-switched" and "fixture-conflict" in job_rows:
+            return dict(item("switched"), local=[dict(hash=conflict_hash, fmt="FBX", name="fixture.zip", k=4)],
+                        thumb="", localOnly=False)
+        if query["op"] == "members" and query.get("hash") == conflict_hash:
+            return dict(names=["Fixture.fbx", *candidates], files=["Fixture.fbx"], mode=0, modelCount=1)
+        if query["op"] == "send" and query.get("hash") == conflict_hash:
+            assert query["files"] == ["Fixture.fbx", "BaseColor_A.png"], query
+            assert query["job"] == "fixture-conflict", query
+            submitted += 1
+            time.sleep(.2)
+            job_rows["fixture-conflict"].update(state="等待", pendingImports=1, confirmations=[])
+            return "Fixture imported manual selection"
+        if query["op"] == "control" and query["job"] == "fixture-conflict":
+            raise AssertionError("Manual conflict cannot remove the import job before Blender processes it")
+        if query["op"] == "options" and query["uid"] == "fixture-switched":
+            return [dict(uid="fixture-high", fmt="FBX", name="Fixture_high.zip", nominalK=4, packageTier="high"),
+                    dict(uid="fixture-raw", fmt="FBX", name="Fixture_raw.zip", nominalK=8, packageTier="raw"),
+                    dict(uid="fixture-attachment", fmt="附件", name="Fixture_Textures.zip", attachment=True)]
         if query["op"] == "verifyLibraryContentChange":
             reordered = reordered or query.get("reorder") is True
             with app.lock:
@@ -379,7 +638,20 @@ def verify_feed_ui(root):
                 app.library_head_checked = time.monotonic()
             return True
         if query["op"] == "variant" and query["uid"] == "fixture-switched":
+            if query["selection"].get("fileId") == "fixture-attachment":
+                assert query["selection"]["mode"] == "locked" and query["import"] is False, query
+                attachment_download = True
+                return dict(state="queued", message="Fixture queued texture attachment")
             assert query["import"] is True
+            if query["selection"].get("localHash") == "c" * 64:
+                assert query["selection"] == dict(mode="locked", textureK=8, modelTier="raw", localHash="c" * 64)
+                assert query["recipe"]["modelTier"] == "raw"
+                return dict(state="cached", message="Fixture used cached Raw")
+            if query["selection"].get("fileId") == "fixture-raw":
+                assert query["selection"] == dict(mode="locked", textureK=8, modelTier="raw", fileId="fixture-raw")
+                assert query["recipe"]["modelTier"] == "raw"
+                raw_locked = True
+                return dict(state="queued", message="Fixture queued Raw package")
             assert query["selection"] == dict(mode="auto",preset="high",textureK=4,modelTier="high")
             return dict(state="cached",message="Fixture imported mixed ZIP")
         return handle(query)
@@ -396,6 +668,7 @@ def verify_feed_ui(root):
         result = json.loads(report.read_text(encoding="utf8"))
         assert "error" not in result, result["error"]
         assert result["report"]["cards"] == 1010
+        result["report"]["hostSource"] = "installation ZIP" if archive_file else "working tree"
         print("PASS: WebView2 feed", result["report"], flush=True)
     finally:
         if proc is not None:

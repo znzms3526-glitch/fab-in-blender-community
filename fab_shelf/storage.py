@@ -100,10 +100,14 @@ def matching_texture(reference, candidates):
         return PurePosixPath(str(path).replace("\\", "/"))
 
     reference = normalized(reference)
+    ref_posix = reference.as_posix().casefold()
+    ref_name = reference.name.casefold()
     key = texture_variant_key(reference)
     matches = [(path, normalized(path)) for path in candidates]
-    for rank in (lambda path: texture_variant_key(path) == key,
-                 lambda path: path.name.casefold() == reference.name.casefold(),
+    for rank in (lambda path: path.as_posix().casefold() == ref_posix,
+                 lambda path: path.as_posix().casefold().endswith("/" + ref_posix.lstrip("/")),
+                 lambda path: texture_variant_key(path) == key,
+                 lambda path: path.name.casefold() == ref_name,
                  lambda path: texture_variant_key(path)[1] == key[1]):
         found = [path for path, name in matches if rank(name)]
         if found:
@@ -225,23 +229,50 @@ def removing_files(root, journal, paths):
             pass
 
 
+def member_identity(package_hash, name):
+    """Return canonical (package_hash, zip_chain, raw_path) for an archive member."""
+    normalized = str(name).replace("\\", "/")
+    parts = normalized.split("/")
+    chain = []
+    for index, part in enumerate(parts[:-1]):
+        if part.lower().endswith(".zip"):
+            chain.append("/".join(parts[: index + 1]))
+            rest = "/".join(parts[index + 1 :])
+            return (package_hash, tuple(chain), rest)
+    return (package_hash, (), normalized)
+
+
+def _stream_sha256(container, info):
+    digest = hashlib.sha256()
+    with container.open(info) as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @contextmanager
-def archive_members(archive, wanted=None):
+def archive_members(archive, wanted=None, *, package_hash="", dedup=False, aliases=None):
     """Expose a nested source ZIP as a directory, keeping member streams open on demand."""
     with ExitStack() as stack:
         members = {}
+
         def collect(container, prefix):
             for info in container.infolist():
+                if info.is_dir():
+                    continue
                 name = prefix + info.filename
-                if Path(name).suffix.lower() in MODELS | IMAGES and (wanted is None or name in wanted):
+                if Path(name).suffix.lower() in MODELS | IMAGES:
                     members.setdefault(name, (container, info))
 
         collect(archive, "")
         for info in archive.infolist():
-            if Path(info.filename).suffix.lower() != ".zip":
+            if info.is_dir() or Path(info.filename).suffix.lower() != ".zip":
                 continue
             prefix = info.filename + "/"
-            if wanted is not None and not any(n.startswith(prefix) and n not in members for n in wanted):
+            if wanted is not None and not any(
+                w.startswith(prefix) or w.replace("\\", "/").casefold().startswith(prefix.casefold())
+                for w in wanted if w not in members
+            ):
                 continue
             try:
                 stream = stack.enter_context(archive.open(info))
@@ -249,6 +280,50 @@ def archive_members(archive, wanted=None):
             except (zipfile.BadZipFile, RuntimeError, NotImplementedError):
                 continue
             collect(inner, prefix)
+
+        if wanted is not None:
+            selected = {}
+            by_folded = {}
+            for name in members:
+                by_folded.setdefault(name.replace("\\", "/").casefold(), []).append(name)
+            for key in wanted:
+                if key in members:
+                    selected[key] = members[key]
+                else:
+                    hits = by_folded.get(str(key).replace("\\", "/").casefold(), ())
+                    if len(hits) == 1:
+                        selected[key] = members[hits[0]]
+            yield selected
+            return
+
+        if dedup and len(members) > 1:
+            by_crc = {}
+            for name, (_, info) in members.items():
+                filename = PurePosixPath(name.replace("\\", "/")).name.casefold()
+                by_crc.setdefault((filename, info.file_size, info.CRC), []).append(name)
+            for group in by_crc.values():
+                if len(group) < 2:
+                    continue
+                by_sha = {}
+                for name in group:
+                    container, info = members[name]
+                    try:
+                        sha = _stream_sha256(container, info)
+                    except (OSError, RuntimeError, zipfile.BadZipFile, EOFError):
+                        continue
+                    by_sha.setdefault((info.file_size, sha), []).append(name)
+                for dupes in by_sha.values():
+                    if len(dupes) < 2:
+                        continue
+                    canonical = min(
+                        dupes,
+                        key=lambda n: (len(member_identity(package_hash, n)[1]), n.casefold(), n),
+                    )
+                    for name in dupes:
+                        if name != canonical:
+                            members.pop(name, None)
+                            if aliases is not None:
+                                aliases[name] = canonical
         yield members
 
 
@@ -280,16 +355,70 @@ def member_checks(cache,source):
     return {source["name"]:(blob.stat().st_size,source["hash"])}
 
 
+def verify_zip(path, cancelled):
+    """Check member CRCs once on a download worker, without extracting to disk."""
+    with zipfile.ZipFile(fs_path(path)) as archive:
+        for member in archive.infolist():
+            if member.is_dir() or member.flag_bits & 1:
+                continue
+            try:
+                with archive.open(member) as stream:
+                    while not cancelled():
+                        if not stream.read(1024 * 1024):
+                            break
+                    else:
+                        return False
+            except NotImplementedError:
+                # Blender may still use the other, supported members.
+                continue
+    return True
+
+
+def discard_broken_blob(cache, digest, stamp):
+    from .catalog import package_fingerprint, package_update
+
+    blob = fs_path(cache / "packages" / digest)
+    with package_update(cache):
+        if stamp is not None and package_fingerprint(blob) == stamp:
+            try:
+                blob.unlink(missing_ok=True)
+            except PermissionError as error:
+                # Another reader can still hold this digest on Windows. A valid
+                # replacement has its own hash and can be downloaded independently.
+                if getattr(error, "winerror", None) not in (32, 33):
+                    raise
+
+
+@contextmanager
+def cached_package_stream(cache, digest):
+    from .catalog import package_fingerprint, package_update
+
+    blob = fs_path(cache / "packages" / digest)
+    with package_update(cache):
+        try:
+            stream = blob.open("rb")
+        except FileNotFoundError:
+            raise ValueError("本地缓存文件已删除，请重新下载") from None
+        stamp = package_fingerprint(blob)
+    try:
+        with stream:
+            yield stream
+    except (zipfile.BadZipFile, zlib.error, EOFError) as error:
+        discard_broken_blob(cache, digest, stamp)
+        raise ValueError("ZIP 下载包损坏或不完整，请重新下载") from error
+
+
 def stage(cache, project, request, *, project_layout=True, asset_root=None, compact=False, checks=None):
     digest = request["hash"]
     if not re.fullmatch("[a-f0-9]{64}", digest):
         raise ValueError("缓存记录无效")
-    blob = fs_path(cache / "packages" / digest)
     names = request["files"]
     mode = request["mode"]
     paths = [safe_member(n) for n in names]
     if not paths or len(set(paths)) != len(paths) or mode not in (0, 1, 2):
         raise ValueError("请选择一组有效文件")
+    if os.name == "nt" and len({p.as_posix().casefold() for p in paths}) != len(paths):
+        raise ValueError("包内存在仅大小写不同的同名文件，无法同时解包")
     if sum(p.suffix.lower() in MODELS for p in paths) != int(mode == 0):
         raise ValueError("模型模式需要一个模型；材质和贴花仅接受贴图")
     root = resolved_path(project)
@@ -299,14 +428,8 @@ def stage(cache, project, request, *, project_layout=True, asset_root=None, comp
     with ExitStack() as stack:
         archive = None
         if not from_bridge:
-            from .catalog import package_update
-
-            with package_update(cache):
-                try:
-                    blob_stream = stack.enter_context(blob.open("rb"))
-                except FileNotFoundError:
-                    raise ValueError("本地缓存文件已删除，请重新下载") from None
-            if zipfile.is_zipfile(blob_stream):
+            blob_stream = stack.enter_context(cached_package_stream(cache, digest))
+            if Path(request["name"]).suffix.lower() == ".zip" or zipfile.is_zipfile(blob_stream):
                 archive = stack.enter_context(zipfile.ZipFile(blob_stream))
         if archive:
             members = stack.enter_context(archive_members(archive, set(names)))

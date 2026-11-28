@@ -122,6 +122,24 @@ def stage_request(cache, project, request):
         paths = [staged[member] for member in request["files"]]
     else:
         paths = storage.stage(cache, project, request, asset_root=root, checks=checks)
+    if attachments := request.get("attachments"):
+        att_paths = []
+        att_records = {}
+        for att in attachments:
+            att_files = att.get("files") or []
+            if not att_files:
+                continue
+            att_checks = {}
+            att_req = dict(hash=att["hash"], name=att.get("name", ""), files=att_files, mode=1,
+                           source=att.get("source") or {})
+            staged_att = storage.stage(cache, project, att_req, asset_root=root, checks=att_checks)
+            for member, p in zip(att_files, staged_att):
+                att_paths.append(p)
+                att_records[storage.resolved_path(p)] = (att.get("source") or {"hash": att["hash"], "name": att.get("name", "")},
+                                                        member, att_checks.get(member))
+        if att_paths:
+            request["_attachment_paths"] = att_paths
+            request["_attachment_records"] = att_records
     request["_file_checks"] = checks
     return paths
 
@@ -132,6 +150,69 @@ def reference(block):
         return source if isinstance(source, dict) else {}
     except (ValueError, TypeError):
         return {}
+
+
+def _has_active_mapping(mat):
+    if not mat or not mat.node_tree:
+        return False
+    output = scene._active_output_node(mat.node_tree)
+    if output is None:
+        return False
+    starts = []
+    for sock_name in ("Surface", "Volume", "Displacement"):
+        sock = output.inputs.get(sock_name)
+        if sock and sock.is_linked:
+            starts.extend(link.from_node for link in sock.links if link.from_node)
+    if not starts:
+        return False
+    reachable = scene._reachable_upstream_nodes(mat.node_tree, starts)
+    for tree, node in reachable:
+        if node.type != "TEX_IMAGE" or not scene._is_usable_image(node.image):
+            continue
+        vec = node.inputs.get("Vector")
+        if not vec or not vec.is_linked:
+            continue
+        for link in vec.links:
+            src = link.from_node
+            if src and src.type == "MAPPING":
+                uv_in = src.inputs.get("Vector")
+                if uv_in and uv_in.is_linked and any(
+                    l.from_node and l.from_node.type == "TEX_COORD" and l.from_socket.name == "UV"
+                    for l in uv_in.links
+                ):
+                    return True
+    return False
+
+
+def material_recipe_summary(mat):
+    """Return (zh_label, en_label) describing the actual applied material recipe, or None."""
+    if not mat:
+        return None
+    raw = mat.get("fab_recipe")
+    if not raw:
+        return None
+    try:
+        values = json.loads(raw)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(values, dict):
+        return None
+    policy = values.get("materialPolicy")
+    if policy == "preserve":
+        return ("原材质", "Original material")
+    if policy == "relinked":
+        return ("已重连", "Relinked")
+    if policy == "fallback":
+        return ("无贴图回退", "No-texture fallback")
+    if "mapping" in values:
+        if values["mapping"]:
+            if _has_active_mapping(mat):
+                return ("Mapping 开", "Mapping On")
+            if scene._is_authored_material(mat):
+                return ("原材质", "Original material")
+            return ("无贴图回退", "No-texture fallback")
+        return ("Mapping 关", "Mapping Off")
+    return None
 
 
 def material_recipe(req):
@@ -164,6 +245,13 @@ def signature(req):
     if recipe:
         source = model_source(req.get("source", {}), req["files"])
         parts.extend((origin_identity(source), source["modelMember"], sorted(req.get("originalFiles", ())), recipe))
+    attachments = [
+        (attachment["hash"], sorted(attachment["files"]), origin_identity(attachment.get("source") or {}))
+        for attachment in req.get("attachments", ())
+        if attachment.get("files")
+    ]
+    if attachments:
+        parts.append(attachments)
     return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
 
 
@@ -217,12 +305,14 @@ def place(ctx, paths, req):
             scene.assign(ctx.active_object, existing)
             return []
     before = set(bpy.data.materials)
-    options = {}
+    outcomes = {}
+    options = {"outcomes": outcomes}
     if "recipe" in req:
         options["recipe"] = req["recipe"]
     if req.get("_original_paths"):
         options["original_images"] = tuple(req["_original_paths"].values())
-    objects = scene.import_files(ctx, paths, mode, name, texture_size=verified_size, **options)
+    all_paths = [*paths, *req.get("_attachment_paths", ())]
+    objects = scene.import_files(ctx, all_paths, mode, name, **options)
     meshes = [o for o in objects if o.type == "MESH"]
     reusable = (mode == 0 and not independent and len(meshes) == 1
                 and all(o.type == "EMPTY" or o == meshes[0] for o in objects)
@@ -233,28 +323,55 @@ def place(ctx, paths, req):
     mats = set(bpy.data.materials) - before
     staged = dict(zip(req["files"], paths)) | req.get("_original_paths", {})
     members = {storage.resolved_path(path): member for member, path in staged.items()}
+    att_records = req.get("_attachment_records", {})
     checks = req.get("_file_checks", {})
     recipe = material_recipe(req)
     images = {}
     for mat in mats:
         mat["fab_source"] = tag
-        if recipe:
+        outcome = outcomes.get(mat)
+        if outcome:
+            policy = outcome["policy"]
+            if policy == "rebuilt":
+                applied = dict(recipe or {})
+                applied.update(
+                    builderVersion=_BUILDER_VERSION,
+                    materialPolicy="rebuilt",
+                    mapping=outcome["mapping"],
+                    channels=outcome["channels"],
+                )
+                mat["fab_recipe"] = json.dumps(applied, sort_keys=True)
+            else:
+                mat["fab_recipe"] = json.dumps(
+                    dict(builderVersion=_BUILDER_VERSION, materialPolicy=policy), sort_keys=True
+                )
+        elif recipe and recipe.get("materialPolicy") == "preserve":
             mat["fab_recipe"] = json.dumps(recipe, sort_keys=True)
         if mode == 1 and not independent:
             mat["fab_key"] = key
         replacements = {}
         for _, node in bound_textures(mat):
             img = node.image
-            member = members.get(storage.resolved_path(bpy.path.abspath(img.filepath)))
+            if not img or not img.filepath:
+                continue
+            resolved_img = storage.resolved_path(bpy.path.abspath(img.filepath))
+            member = members.get(resolved_img)
+            img_source, img_check = source, checks.get(member)
+            if not member and resolved_img in att_records:
+                img_source, member, img_check = att_records[resolved_img]
             if member:
-                if (previous := reference(img)) and origin_identity(previous) != identity:
+                if (previous := reference(img)) and origin_identity(previous) != origin_identity(img_source):
                     if img not in images:
                         images[img] = img.copy()
                     replacements[img] = images[img]
                     img = replacements[img]
-                _remember_image(img, source, member, checks.get(member))
+                _remember_image(img, img_source, member, img_check)
         if replacements:
             scene._write_image_replacements(mat.node_tree, replacements)
+    req["_import_summary"] = dict(
+        fallback=any(o.get("policy") == "fallback" for o in outcomes.values()),
+        policies={o.get("policy") for o in outcomes.values()},
+    )
     if objects:
         scene.place_at_cursor(ctx, objects, collection, cursor)
     for obj in meshes:

@@ -8,6 +8,12 @@ Browse Fab from a separate Blender companion window, claim free assets on Fab, o
 
 **[下载 Windows 插件 / Download for Windows](https://github.com/znzms3526-glitch/fab-in-blender-community/releases/latest)** · [使用说明](使用说明.md) · [报告问题 / Report an issue](https://github.com/znzms3526-glitch/fab-in-blender-community/issues)
 
+## 0.15.2 导入目标与下载恢复
+
+- 同一场景里撤销、重做后可以继续导入。在另一场景重开副屏时，旧请求会停止。下载材质时改选物体、材质槽或选面，插件会等你在 Blender 的 Fab 面板确认。
+- 新工程首次保存后，暂停的下载和已有进度会随工程恢复。另存为后，新任务归新工程，旧请求会在写入新工程前停止。
+- 下载的 ZIP 里若有贴图校验失败，点队列的「继续」会重新获取该文件。工程目录写入失败时，修正目录后可从已有缓存继续。
+
 ## 0.15.0 模型精度和贴图
 
 - 3D 模型主卡提供低、中、高三档，默认高。材质和贴花沿用 1K、2K、4K、8K。主按钮会直接导入，按需先下载。详情可手动指定实际文件、LOD 和贴图尺寸，也可以仅下载。

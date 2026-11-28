@@ -301,8 +301,8 @@ class FAB_PT_library(bpy.types.Panel):
     def draw(self,context):
         ui=state();layout=self.layout
         bar=layout.row(align=True)
-        from . import _session
-        target=(Path(bpy.data.filepath).name or "未保存工程")+" › "+_session["scene"].name
+        from . import gallery_target_label
+        target=gallery_target_label()
         bar.label(text="Fab   /   "+target,icon="ASSET_MANAGER")
         bar.prop(ui,"scope",expand=True)
         btn(bar,"REFRESH","","FILE_REFRESH");btn(bar,"LOGIN","","USER")
